@@ -1,0 +1,26 @@
+{
+  "name": "jeeves",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "bin": { "jeeves": "dist/src/cli.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/src/cli.js",
+    "test:live": "npm run build && node dist/src/live-smoke.js",
+    "benchmark": "npm run build && node dist/src/benchmark.js"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "1.0.14",
+    "stream-json": "1.9.1",
+    "typescript": "6.0.3",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "26.5.1",
+    "@types/stream-json": "1.7.8"
+  }
+}
