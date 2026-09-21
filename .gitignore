@@ -1,0 +1,7 @@
+.env
+.env.*
+/JuiceShop/juice-shop/
+node_modules/
+npm-debug.log*
+.DS_Store
+/.vscode/settings.json
