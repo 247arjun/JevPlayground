@@ -2,7 +2,7 @@ import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
-import { createJevClient, evaluate, hash, inventory, rankFunctions, requestKey, sanitizerVersion, validateQuestions, validateResponse } from './analysis.mjs'
+import { classifyFunctions, createJevClient, evaluate, hash, inventory, questionMode, rankFunctions, requestKey, sanitizerVersion, validateQuestions, validateResponse } from './analysis.mjs'
 
 const directory = path.dirname(fileURLToPath(import.meta.url))
 const defaultModel = 'jev-1.13.0'
@@ -44,10 +44,34 @@ function reportMarkdown (summary, ranked, root, output) {
   return lines.join('\n') + '\n'
 }
 
+function classificationMarkdown (summary, classifications, root, output) {
+  const lines = [
+    '# Function Classification Inventory',
+    '',
+    `Status: **${summary.status}**. Classified ${summary.evaluated}/${summary.selected} selected functions; ${summary.failed} failed; ${summary.pending} pending.`,
+    '',
+    `Model: ${summary.model}. Question count: ${summary.questionCount}. Sanitizer: ${summary.sanitizerVersion}.`,
+    '',
+    'Operation, input, influence, guard, output, and missing-context labels are independent observations, not vulnerabilities or risk ranks. A present guard does not establish protection for every operation. Different present dimensions may refer to different operations.',
+    '',
+    'All answers, including absent and unclear, are retained in classifications.json. Join its id to functions.jsonl for original and submitted source, and use questions.snapshot.json for the exact rubric. Nested functions overlap their parent bodies.',
+    '',
+    `${summary.filesWithParseErrors} source files have parse diagnostics. Top-level execution, non-TS/JS files, excluded directories, and parse-error recovery remain coverage limitations.`,
+    '',
+    '| Function | Source | Present Dimensions | Unclear Dimensions | Guard Failure Behavior |',
+    '| --- | --- | --- | --- | --- |'
+  ]
+  for (const item of classifications) {
+    const relative = path.relative(output, path.join(root, item.file)).split(path.sep).map(encodeURIComponent).join('/')
+    lines.push(`| ${markdownText(item.name)} | [${markdownText(item.file)}:${item.start.line}](${relative}#L${item.start.line}) | ${item.presentCategories.map(markdownText).join(', ') || 'None'} | ${item.unclearCategories.map(markdownText).join(', ') || 'None'} | ${markdownText(item.guardFailureBehavior ?? 'Not asked')} |`)
+  }
+  return lines.join('\n') + '\n'
+}
+
 export async function runAnalysis ({
   root = path.join(directory, 'verdaccio'),
   questionsPath = path.join(directory, 'questions.json'),
-  output = path.join(directory, 'analysis-output'),
+  output,
   model = defaultModel,
   inventoryOnly = false,
   concurrency = 6,
@@ -59,16 +83,38 @@ export async function runAnalysis ({
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 16) throw new Error('Concurrency must be between 1 and 16')
   if (limit !== Infinity && (!Number.isInteger(limit) || limit < 1)) throw new Error('Limit must be a positive integer')
   if (!/^jev-\d+\.\d+\.\d+$/.test(model)) throw new Error('Use a pinned Jev version, not a moving alias')
-  root = path.resolve(root)
-  output = path.resolve(output)
-  if (output === root || output.startsWith(root + path.sep)) throw new Error('Keep analysis output outside the scanned repository')
   const questions = validateQuestions(JSON.parse(await readFile(questionsPath, 'utf8')))
+  const mode = questionMode(questions)
+  const questionsHash = hash(JSON.stringify(questions))
+  const resultFile = mode === 'classification' ? 'classifications.json' : 'ranked.json'
+  root = path.resolve(root)
+  output = path.resolve(output ?? path.join(directory, 'analysis-output', ...(mode === 'classification' ? ['classification'] : [])))
+  if (output === root || output.startsWith(root + path.sep)) throw new Error('Keep analysis output outside the scanned repository')
   await mkdir(output, { recursive: true, mode: 0o700 })
   const lockPath = path.join(output, '.lock')
   const lock = await open(lockPath, 'wx', 0o600).catch(() => { throw new Error('Output is locked; check for an active scan before removing analysis-output/.lock') })
   try {
     await lock.writeFile(String(process.pid))
     const startedAt = new Date().toISOString()
+    const startClock = performance.now()
+    // Refuse to overwrite a different experiment, including legacy output that
+    // predates run.json. A fresh directory is required when the rubric changes.
+    const run = { schemaVersion: 1, root, model, mode, questionsHash, sanitizerVersion, resultFile }
+    for (const name of ['run.json', 'summary.json']) {
+      let previous
+      try {
+        previous = JSON.parse(await readFile(path.join(output, name), 'utf8'))
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error
+        continue
+      }
+      if (['root', 'model', 'questionsHash', 'sanitizerVersion'].some(key => previous[key] !== run[key]) ||
+          previous.mode !== undefined && previous.mode !== mode) {
+        throw new Error('Output belongs to a different experiment; choose a new --output directory')
+      }
+    }
+    await writeJson(path.join(output, 'run.json'), run)
+    await writeJson(path.join(output, 'questions.snapshot.json'), questions)
     const scanned = await inventory(root)
     const selected = scanned.functions.filter(item => item.file.includes(file)).slice(0, limit)
     await writeJson(path.join(output, 'inventory.json'), {
@@ -131,26 +177,34 @@ export async function runAnalysis ({
       }
       await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, () => worker()))
     }
-    const ranked = rankFunctions(selected, records)
+    const results = mode === 'classification'
+      ? classifyFunctions(selected, records, questions, model)
+      : rankFunctions(selected, records)
     const failures = selected.filter(item => records.get(item.id)?.status === 'failed').map(item => ({ id: item.id, error: records.get(item.id).error }))
     const pending = selected.filter(item => !records.has(item.id)).map(item => item.id)
     const summary = {
       status: inventoryOnly ? 'inventory_only' : blocked ? 'blocked' : signal?.aborted ? 'interrupted' : failures.length || pending.length ? 'partial' : 'complete',
       blockReason: blocked,
-      root, model, sanitizerVersion, questionsHash: hash(JSON.stringify(questions)), questionCount: Object.keys(questions).length,
+      schemaVersion: 1, mode, resultFile,
+      root, model, sanitizerVersion, questionsHash, questionCount: Object.keys(questions).length,
       startedAt, finishedAt: new Date().toISOString(),
       files: scanned.files.length, functions: scanned.functions.length, selected: selected.length,
       filesWithParseErrors: scanned.files.filter(item => item.diagnostics.length).length,
-      evaluated: ranked.length, reused, failed: failures.length, pending: pending.length,
+      evaluated: results.length, reused, failed: failures.length, pending: pending.length,
       newInputTokens,
-      evaluationCompleteForSelection: !inventoryOnly && ranked.length === selected.length,
+      evaluationCompleteForSelection: !inventoryOnly && results.length === selected.length,
       selectionCoversInventory: selected.length === scanned.functions.length,
       coverageCaveat: 'Parse errors and excluded/non-function code prevent a claim of whole-repository security coverage.',
       failures, pendingIds: pending
     }
-    await writeJson(path.join(output, 'ranked.json'), ranked)
+    await writeJson(path.join(output, resultFile), results)
+    const report = mode === 'classification'
+      ? classificationMarkdown(summary, results, root, output)
+      : reportMarkdown(summary, results, root, output)
+    await writeFile(path.join(output, 'report.md'), report, { mode: 0o600 })
+    summary.finishedAt = new Date().toISOString()
+    summary.elapsedSeconds = Number(((performance.now() - startClock) / 1000).toFixed(3))
     await writeJson(path.join(output, 'summary.json'), summary)
-    await writeFile(path.join(output, 'report.md'), reportMarkdown(summary, ranked, root, output), { mode: 0o600 })
     return summary
   } finally {
     await lock.close()

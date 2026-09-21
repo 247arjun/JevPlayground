@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { createJevClient, evaluate, extractFunctions, hash, inventory, labels, rankFunctions, requestFor, requestKey, sanitizerVersion, validateQuestions, validateResponse } from './analysis.mjs'
+import { classifyFunctions, createJevClient, evaluate, extractFunctions, hash, inventory, labels, questionMode, rankFunctions, requestFor, requestKey, sanitizerVersion, validateQuestions, validateResponse } from './analysis.mjs'
 import { runAnalysis } from './analyze.mjs'
 
 test('extracts all executable function forms with exact source and nesting', () => {
@@ -310,6 +310,109 @@ test('runner records missing credentials and failures instead of fabricating ran
     assert.equal(failed.evaluated, 0)
     const dryRun = await runAnalysis({ ...options, inventoryOnly: true })
     assert.equal(dryRun.status, 'inventory_only')
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+const classificationQuestions = {
+  operation_database_query: {
+    type: 'choice', instructions: 'Evaluate state.function for data queries',
+    criteria: { present: 'Visible query', absent: 'No visible query', unclear: 'Unresolved query semantics' }
+  },
+  context_input_provenance: {
+    type: 'choice', instructions: 'Evaluate missing input provenance in state.function',
+    criteria: { present: 'Material missing provenance', absent: 'No provenance gap', unclear: 'Relevance unresolved' }
+  },
+  guard_failure_behavior: {
+    type: 'choice', instructions: 'Evaluate local guard flow in state.function',
+    criteria: { not_applicable: 'No related guard', blocked_on_shown_failures: 'Guard blocks operation', continues_on_a_shown_path: 'Guard failure continues', unclear: 'Flow unresolved' }
+  }
+}
+
+function classificationResponse () {
+  const choices = ['present', 'unclear', 'blocked_on_shown_failures']
+  return {
+    model,
+    answers: Object.fromEntries(Object.entries(classificationQuestions).map(([name, question], index) => [name, {
+      type: 'choice', choice: choices[index], confidence: 1,
+      probabilities: Object.fromEntries(Object.keys(question.criteria).map(label => [label, Number(label === choices[index])]))
+    }])),
+    usage: { input_tokens: 100, output_tokens: 20 }
+  }
+}
+
+test('validates both rubric modes and per-question answer labels', async () => {
+  assert.equal(questionMode(questions), 'defects')
+  assert.equal(questionMode(classificationQuestions), 'classification')
+  const actual = JSON.parse(await readFile(new URL('./questions.json', import.meta.url), 'utf8'))
+  assert.equal(Object.keys(actual).length, 43)
+  assert.equal(questionMode(actual), 'classification')
+  assert.throws(() => questionMode({ ...classificationQuestions, ...questions }), /mixed/)
+  const response = classificationResponse()
+  assert.equal(validateResponse(response, classificationQuestions, model), response)
+  const rounded = structuredClone(response)
+  rounded.answers.operation_database_query.probabilities.present = 0.99
+  validateResponse(rounded, classificationQuestions, model)
+  rounded.answers.operation_database_query.probabilities.present = 0.98
+  assert.throws(() => validateResponse(rounded, classificationQuestions, model), /invalid_response/)
+  response.answers.operation_database_query = answer('local_defect')
+  assert.throws(() => validateResponse(response, classificationQuestions, model), /invalid_response/)
+})
+
+test('classification preserves every answer and provenance without defect rankings', () => {
+  const response = classificationResponse()
+  const records = new Map([[item.id, { status: 'evaluated', response, evaluatedAt: '2026-09-21T00:00:00.000Z' }]])
+  const result = classifyFunctions([item, { ...item, id: 'pending' }], records, classificationQuestions, model)
+  assert.equal(result.length, 1)
+  assert.deepEqual(result[0].answers, response.answers)
+  assert.deepEqual(result[0].presentCategories, ['operation_database_query'])
+  assert.deepEqual(result[0].unclearCategories, ['context_input_provenance'])
+  assert.equal(result[0].guardFailureBehavior, 'blocked_on_shown_failures')
+  assert.equal(result[0].requestKey, requestKey(item, classificationQuestions, model))
+  assert.equal(result[0].questionsHash, hash(JSON.stringify(classificationQuestions)))
+  assert.ok(!Object.hasOwn(result[0], 'reviewRank'))
+  assert.ok(!Object.hasOwn(result[0], 'defectEvidence'))
+  assert.ok(!Object.hasOwn(result[0], 'sanitizedFunction'))
+})
+
+test('classification runner saves exact rubric and results, resumes, and protects other experiments', async () => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), 'jev-classifier-'))
+  try {
+    const root = path.join(workspace, 'repo')
+    const output = path.join(workspace, 'output')
+    const questionsPath = path.join(workspace, 'questions.json')
+    await mkdir(root)
+    await writeFile(path.join(root, 'example.ts'), 'function example(value) { /* hint */ return value }')
+    await writeFile(questionsPath, JSON.stringify(classificationQuestions))
+    let calls = 0
+    const client = { systemOne: async request => {
+      calls++
+      assert.deepEqual(request.questions, classificationQuestions)
+      assert.ok(!request.state.function.includes('hint'))
+      return classificationResponse()
+    } }
+    const options = { root, output, questionsPath, model }
+    const first = await runAnalysis(options, { client })
+    assert.equal(first.mode, 'classification')
+    assert.equal(first.resultFile, 'classifications.json')
+    assert.equal(first.status, 'complete')
+    assert.ok(first.elapsedSeconds >= 0)
+    const saved = JSON.parse(await readFile(path.join(output, 'classifications.json'), 'utf8'))
+    assert.equal(saved.length, 1)
+    assert.deepEqual(saved[0].answers, classificationResponse().answers)
+    assert.ok(!Object.hasOwn(saved[0], 'defectEvidence'))
+    await assert.rejects(readFile(path.join(output, 'ranked.json')), { code: 'ENOENT' })
+    assert.deepEqual(JSON.parse(await readFile(path.join(output, 'questions.snapshot.json'), 'utf8')), classificationQuestions)
+    const resumed = await runAnalysis(options, { client })
+    assert.equal(resumed.reused, 1)
+    assert.equal(calls, 1)
+    const originalSummary = await readFile(path.join(output, 'summary.json'), 'utf8')
+    await writeFile(questionsPath, JSON.stringify(questions))
+    await assert.rejects(runAnalysis(options, { client }), /different experiment/)
+    assert.equal(await readFile(path.join(output, 'summary.json'), 'utf8'), originalSummary)
+    assert.equal(calls, 1)
+    await assert.rejects(readFile(path.join(output, '.lock')), { code: 'ENOENT' })
   } finally {
     await rm(workspace, { recursive: true, force: true })
   }

@@ -201,6 +201,8 @@ export async function inventory (root) {
 export const labels = ['not_applicable', 'locally_protected', 'local_defect', 'context_required']
 // This is review routing precedence, not an ordinal vulnerability severity scale.
 const priority = ['local_defect', 'context_required', 'locally_protected', 'not_applicable']
+const presenceLabels = ['present', 'absent', 'unclear']
+const guardLabels = ['not_applicable', 'blocked_on_shown_failures', 'continues_on_a_shown_path', 'unclear']
 
 function sameKeys (object, keys) {
   return object && typeof object === 'object' && !Array.isArray(object) &&
@@ -208,17 +210,28 @@ function sameKeys (object, keys) {
 }
 
 export function validateQuestions (questions) {
-  // Ranking depends on this four-label contract. Reject an incompatible rubric
-  // before making any billable API calls instead of silently misinterpreting it.
+  // Reject mixed rubrics: an operation inventory must not be given defect ranks.
   if (!questions || typeof questions !== 'object' || Array.isArray(questions) || !Object.keys(questions).length) {
     throw new Error('Questions must be a nonempty object')
   }
   for (const question of Object.values(questions)) {
-    if (question?.type !== 'choice' || !question.instructions || !sameKeys(question.criteria, labels)) {
-      throw new Error('Every question must be a Choice with the four local-evidence labels')
+    if (question?.type !== 'choice' || !question.instructions || !question.criteria ||
+        !Object.values(question.criteria).every(description => typeof description === 'string' && description.trim())) {
+      throw new Error('Every question must be a Choice with nonempty criterion descriptions')
     }
   }
+  const defects = Object.values(questions).every(question => sameKeys(question.criteria, labels))
+  const classification = Object.entries(questions).every(([name, question]) =>
+    /^(operation|input|influence|guard|output|context)_/.test(name) &&
+    sameKeys(question.criteria, name === 'guard_failure_behavior' ? guardLabels : presenceLabels)
+  )
+  if (!defects && !classification) throw new Error('Unsupported or mixed question rubric')
   return questions
+}
+
+export function questionMode (questions) {
+  validateQuestions(questions)
+  return Object.values(questions).every(question => sameKeys(question.criteria, labels)) ? 'defects' : 'classification'
 }
 
 export function requestFor (item, questions, model) {
@@ -243,16 +256,18 @@ export function validateResponse (response, questions, model) {
   if (response?.model !== model || !sameKeys(response.answers, Object.keys(questions))) {
     throw new Error('invalid_response')
   }
-  for (const answer of Object.values(response.answers)) {
-    if (answer?.type !== 'choice' || !labels.includes(answer.choice) ||
-        !isProbability(answer.confidence) || !sameKeys(answer.probabilities, labels)) {
+  for (const [name, question] of Object.entries(questions)) {
+    const answer = response.answers[name]
+    const expectedLabels = Object.keys(question.criteria)
+    if (answer?.type !== 'choice' || !expectedLabels.includes(answer.choice) ||
+        !isProbability(answer.confidence) || !sameKeys(answer.probabilities, expectedLabels)) {
       throw new Error('invalid_response')
     }
     const probabilities = Object.values(answer.probabilities)
-    // Jev serializes probabilities at two decimal places. Four independently
-    // rounded values can deviate from a unit sum by up to 4 * 0.005. Preserve
+    // Independently rounded values can deviate from a unit sum by up to
+    // the number of labels * 0.005. Preserve
     // the API values rather than renormalizing and changing the reported evidence.
-    const roundingTolerance = labels.length * 0.005 + Number.EPSILON
+    const roundingTolerance = expectedLabels.length * 0.005 + Number.EPSILON
     if (!probabilities.every(isProbability) ||
       Math.abs(probabilities.reduce((total, value) => total + value, 0) - 1) > roundingTolerance ||
         answer.probabilities[answer.choice] + 0.000001 < Math.max(...probabilities)) {
@@ -330,4 +345,26 @@ export function rankFunctions (items, records) {
   )
   ranked.forEach((item, index) => { item.reviewRank = index + 1 })
   return ranked
+}
+
+export function classifyFunctions (items, records, questions, model) {
+  const questionsHash = hash(JSON.stringify(questions))
+  return items.filter(item => records.get(item.id)?.status === 'evaluated').map(item => {
+    const { function: source, body, sanitizedFunction, ...metadata } = item
+    const { response, evaluatedAt } = records.get(item.id)
+    return {
+      ...metadata,
+      schemaVersion: 1,
+      mode: 'classification',
+      questionsHash,
+      requestKey: requestKey(item, questions, model),
+      model: response.model,
+      evaluatedAt,
+      usage: response.usage,
+      presentCategories: Object.entries(response.answers).filter(([, answer]) => answer.choice === 'present').map(([name]) => name),
+      unclearCategories: Object.entries(response.answers).filter(([, answer]) => answer.choice === 'unclear').map(([name]) => name),
+      guardFailureBehavior: response.answers.guard_failure_behavior?.choice ?? null,
+      answers: response.answers
+    }
+  })
 }
