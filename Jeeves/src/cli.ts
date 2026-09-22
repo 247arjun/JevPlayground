@@ -15,6 +15,10 @@ import { createClient, stopClient } from './copilot/client.js'
 import { CopilotBackend } from './agents/runner.js'
 import { runInvestigations } from './orchestration/run.js'
 import { report } from './reporting.js'
+import { retryFailedTasks } from './orchestration/tasks.js'
+import { defaultLimits, limitsSchema } from './domain.js'
+import { readBounded } from './security.js'
+import { approveValidation, executeValidation } from './validation.js'
 
 export async function main (args = process.argv.slice(2)): Promise<void> {
   const command = args[0]
@@ -22,7 +26,8 @@ export async function main (args = process.argv.slice(2)): Promise<void> {
     dataset: { type: 'string' }, repo: { type: 'string' }, run: { type: 'string' },
     config: { type: 'string' }, model: { type: 'string' }, workers: { type: 'string' },
     'max-operations': { type: 'string' }, 'semantic-project': { type: 'string' },
-    'recover-lock': { type: 'boolean' }, 'allow-live': { type: 'boolean' }
+    'recover-lock': { type: 'boolean' }, 'allow-live': { type: 'boolean' }, 'retry-failed': { type: 'boolean' },
+    approval: { type: 'string' }, 'validation-plan': { type: 'string' }, 'approve-execution': { type: 'boolean' }
   } })
   if (command === 'doctor') {
     const dotnet = spawnSync('dotnet', ['--list-sdks'], { encoding: 'utf8', timeout: 5000 })
@@ -32,6 +37,7 @@ export async function main (args = process.argv.slice(2)): Promise<void> {
   }
   if (!values.run) throw new Error('run_path_required')
   const run = path.resolve(values.run)
+  const limits = values.config ? limitsSchema.parse(JSON.parse((await readBounded(path.dirname(path.resolve(values.config)), path.basename(values.config), 65536)).toString())) : defaultLimits
   if (command === 'import') {
     if (!values.repo || !values.dataset) throw new Error('import_paths_required')
     console.log(JSON.stringify(await importDataset(values.dataset, values.repo, run), null, 2)); return
@@ -61,9 +67,18 @@ export async function main (args = process.argv.slice(2)): Promise<void> {
     return
   }
   if (command === 'report') { console.log(JSON.stringify(await report(run), null, 2)); return }
+  if (command === 'validate') {
+    if (values['validation-plan'] && values['approve-execution']) { console.log(JSON.stringify(await approveValidation(run, values['validation-plan']), null, 2)); return }
+    if (!values.approval) throw new Error('explicit_validation_approval_required')
+    console.log(JSON.stringify(await executeValidation(run, values.approval), null, 2)); return
+  }
   if (command === 'run' || command === 'resume') {
     if (!values['allow-live']) throw new Error('live_source_disclosure_requires_allow_live')
     if (!values.model) throw new Error('explicit_model_required')
+    if (values['retry-failed']) await withRunLock(run, async () => {
+      const store = await Store.open(run)
+      try { await retryFailedTasks(store) } finally { await store.close() }
+    })
     const client = await createClient(run)
     const controller = new AbortController()
     const cancel = () => controller.abort()
@@ -71,7 +86,7 @@ export async function main (args = process.argv.slice(2)): Promise<void> {
     try {
       const models = await client.listModels()
       if (!models.some(model => model.id === values.model)) throw new Error('model_unavailable')
-      console.log(JSON.stringify(await runInvestigations(run, new CopilotBackend(client, values.model, run), values.workers ? Number(values.workers) : 2, undefined, controller.signal), null, 2))
+      console.log(JSON.stringify(await runInvestigations(run, new CopilotBackend(client, values.model, run, limits), values.workers ? Number(values.workers) : 2, limits, controller.signal), null, 2))
       await report(run)
     } finally { process.off('SIGINT', cancel); process.off('SIGTERM', cancel); await stopClient(client) }
     return

@@ -1,4 +1,4 @@
-import { mkdir } from 'node:fs/promises'
+import { lstat, mkdir, chmod, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { Worker } from 'node:worker_threads'
 import type { SQLInputValue } from 'node:sqlite'
@@ -38,8 +38,15 @@ export class Store {
   }
   static async open (root: string): Promise<Store> {
     await mkdir(root, { recursive: true, mode: 0o700 })
+    if ((await lstat(root)).isSymbolicLink()) throw new Error('symlink_not_allowed')
+    for (const name of ['state.sqlite', 'state.sqlite-wal', 'state.sqlite-shm']) {
+      try { if ((await lstat(path.join(root, name))).isSymbolicLink()) throw new Error('symlink_not_allowed') } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
     const store = new Store(root)
     await store.ready
+    await chmod(path.join(root, 'state.sqlite'), 0o600)
     return store
   }
   private async send (kind: string, operations: Operation[] = []): Promise<unknown[]> {

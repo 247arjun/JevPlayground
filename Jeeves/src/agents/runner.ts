@@ -12,10 +12,12 @@ const roles: Record<string, string> = {
 }
 
 export interface AgentBackend {
+  identity?: { provider: string, model: string, promptVersion: string }
   execute(task: Row, context: unknown, gateway: Gateway, signal: AbortSignal): Promise<void>
 }
 
 export class CopilotBackend implements AgentBackend {
+  get identity () { return { provider: 'github-copilot', model: this.model, promptVersion: 'roles-v1' } }
   constructor (private readonly client: CopilotClient, private readonly model: string, private readonly run: string, private readonly limits: Limits = defaultLimits) {}
   async execute (task: Row, context: unknown, gateway: Gateway, signal: AbortSignal): Promise<void> {
     const session = await this.client.createSession(sessionConfiguration(path.join(this.run, 'runtime/work'), this.model, gateway.tools(), common + '\n' + roles[String(task.role)]))

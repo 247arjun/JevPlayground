@@ -11,6 +11,7 @@ export async function report (run: string): Promise<Record<string, unknown>> {
   const jsonFile = path.join(directory, 'investigations.json')
   const markdownFile = path.join(directory, 'summary.md')
   const json = await open(jsonFile + '.tmp', 'w', 0o600); const markdown = await open(markdownFile + '.tmp', 'w', 0o600)
+  let complete = false
   try {
     await json.write('[\n')
     await markdown.write('# Jeeves Investigation Report\n\nModel hypotheses, not verified vulnerabilities. No production resources were tested.\n\n| Task | Theme | State | Disposition | Summary |\n| --- | --- | --- | --- | --- |\n')
@@ -25,9 +26,11 @@ export async function report (run: string): Promise<Record<string, unknown>> {
     await json.write('\n]\n'); await json.sync(); await markdown.sync()
     const coverage = { manifest: await store.get('manifest'), index: await store.get('indexStats'), capabilities: await store.query('SELECT capability,reasons,COUNT(*) AS count FROM coverage GROUP BY capability,reasons'), tasks: await store.query('SELECT state,COUNT(*) AS count FROM tasks GROUP BY state'), modelCalls: await store.get('modelCalls') ?? 0, caveats: ['Only planned operations investigated', 'Callers are candidates; dynamic dispatch remains unresolved', 'No automatic vulnerability or safety certification', 'Memory RSS limit is soft; compiler heap and deadlines are enforced'] }
     await atomicJson(path.join(directory, 'coverage.json'), coverage)
+    complete = true
     return { investigations: count, ...coverage }
   } finally {
     await json.close(); await markdown.close(); await store.close()
-    await rename(jsonFile + '.tmp', jsonFile); await rename(markdownFile + '.tmp', markdownFile)
+    if (complete) { await rename(jsonFile + '.tmp', jsonFile); await rename(markdownFile + '.tmp', markdownFile) }
+    else { await rm(jsonFile + '.tmp', { force: true }); await rm(markdownFile + '.tmp', { force: true }) }
   }
 }

@@ -14,6 +14,11 @@ export async function runInvestigations (run: string, backend: AgentBackend, wor
     const store = await Store.open(run); const navigation = new Navigation(store)
     try {
       if (!await store.get('planHash') || !await store.get('indexGeneration')) throw new Error('plan_not_ready')
+      const identity = backend.identity ?? { provider: 'test', model: 'fake', promptVersion: 'test' }
+      const previousIdentity = await store.get('agentIdentity')
+      if (previousIdentity && JSON.stringify(previousIdentity) !== JSON.stringify(identity)) throw new Error('different_agent_requires_new_run')
+      await store.set('agentIdentity', identity)
+      await store.set('limits', limits)
       await recoverTasks(store)
       async function work (): Promise<void> {
         while (!signal.aborted) {
@@ -30,7 +35,7 @@ export async function runInvestigations (run: string, backend: AgentBackend, wor
             await store.execute('UPDATE attempts SET request_artifact=? WHERE id=?', [requestHash, String(task.attempt)])
             await backend.execute(task, context, gateway, signal)
             if (!gateway.accepted) throw new Error('missing_structured_result')
-            const result = { ...gateway.accepted, role: task.role, taskId: task.id, attempt: task.attempt, observedAt: new Date().toISOString(), usage: gateway.usage(), promptVersion: 'roles-v1', modelEvidenceNotRuntimeProof: true }
+            const result = { ...gateway.accepted, role: task.role, taskId: task.id, attempt: task.attempt, observedAt: new Date().toISOString(), usage: gateway.usage(), agent: identity, modelEvidenceNotRuntimeProof: true }
             const resultHash = await putArtifact(run, result)
             await finishTask(store, task, resultHash, gateway.accepted)
           } catch (error) {

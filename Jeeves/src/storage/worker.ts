@@ -2,6 +2,8 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { parentPort, workerData } from 'node:worker_threads'
 
 const database = new DatabaseSync(workerData.file as string)
+const version = database.prepare('PRAGMA user_version').get() as { user_version: number }
+if (version.user_version > 1) throw new Error('unsupported_database_version')
 database.exec(`
   PRAGMA journal_mode=WAL;
   PRAGMA synchronous=FULL;

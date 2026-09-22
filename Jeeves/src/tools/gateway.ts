@@ -7,6 +7,7 @@ import { errorCode, hash, readBounded } from '../security.js'
 import { Store, putArtifact } from '../storage/store.js'
 import { Navigation } from '../analysis/navigation.js'
 import { maskComments } from '../analysis/syntax.js'
+import { frameworkEvidence } from '../models.js'
 
 export class Gateway {
   private calls = 0
@@ -23,8 +24,13 @@ export class Gateway {
     if (!record) throw new Error('source_outside_snapshot')
     const original = (await readBounded(path.join(this.store.root, 'snapshot/source'), file, this.limits.maxFileBytes)).toString()
     if (hash(original) !== record.hash) throw new Error('snapshot_hash_mismatch')
-    if (record.language === 'csharp') throw new Error('csharp_sanitizer_required')
-    const sanitized = record.language === 'tsjs' ? maskComments(file, original) : original
+    let sanitized = record.language === 'tsjs' ? maskComments(file, original) : original
+    if (record.language === 'csharp') {
+      const comments = await this.navigation.csharp.request('comments', { file }) as { ranges: Array<{ start: number, end: number }> }
+      const pieces: string[] = []; let cursor = 0
+      for (const range of comments.ranges) { pieces.push(original.slice(cursor, range.start), original.slice(range.start, range.end).replace(/[^\r\n\u2028\u2029]/g, ' ')); cursor = range.end }
+      pieces.push(original.slice(cursor)); sanitized = pieces.join('')
+    }
     this.sourceCache = { file, hash: String(record.hash), original, sanitized }
     return this.sourceCache
   }
@@ -68,6 +74,9 @@ export class Gateway {
         }
         visit(parsed)
         if (!found) throw new Error('operation_not_syntax_node')
+      } else if (/\.cs$/.test(result.operation.file)) {
+        const resultSpan = await this.navigation.csharp.request('locate', { file: result.operation.file, start: result.operation.start, end: result.operation.end }) as { found: boolean }
+        if (!resultSpan.found) throw new Error('operation_not_syntax_node')
       }
     }
     this.accepted = result
@@ -91,6 +100,7 @@ export class Gateway {
       defineTool('resolve_call', { description: 'Resolve one indexed call in an explicitly selected project. Returned targets remain candidates; missing dependencies are reported.', parameters: z.object({ file: z.string(), start: z.number().int().nonnegative(), project: z.string() }).strict(), handler: wrap(async input => await this.navigation.resolve(input.file, input.start, input.project)) }),
       defineTool('list_projects', { description: 'Page project configuration IDs for semantic resolution.', parameters: z.object({ after: z.string().default('') }).strict(), handler: wrap(async input => ({ projects: await this.store.query('SELECT * FROM projects WHERE id>? ORDER BY id LIMIT 50', [input.after]), completion: 'partial', reason: 'Use last ID to continue until an empty page' })) }),
       defineTool('inspect_local', { description: 'Locate candidate definitions, operations, and control conditions. This is syntax evidence, not a taint or guard proof.', parameters: z.object({ file: z.string(), start: z.number().int().nonnegative(), end: z.number().int().positive() }).strict(), handler: wrap(async input => await this.navigation.inspect(input.file, input.start, input.end)) }),
+      defineTool('inspect_framework', { description: 'Inspect import-linked framework/API and declared Azure configuration evidence. Does not inspect live Azure or certify authorization.', parameters: z.object({ file: z.string() }).strict(), handler: wrap(async input => frameworkEvidence(input.file, (await this.source(input.file)).sanitized)) }),
       defineTool('search_snapshot', { description: 'Bounded literal search over snapshot files for unresolved relationships. Returns candidate locations; read them to verify.', parameters: z.object({ text: z.string().min(1).max(200), after: z.string().default('') }).strict(), handler: wrap(async input => {
         const files = await this.store.query('SELECT path FROM files WHERE path>? ORDER BY path LIMIT 30', [input.after])
         const matches: unknown[] = []

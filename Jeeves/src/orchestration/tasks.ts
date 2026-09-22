@@ -95,3 +95,7 @@ export async function recoverTasks (store: Store): Promise<number> {
   ])
   return (result[1] as Row[]).length
 }
+
+export async function retryFailedTasks (store: Store): Promise<void> {
+  await store.execute("UPDATE tasks SET state='queued',attempt=NULL,error=NULL WHERE state='failed' AND (SELECT COUNT(*) FROM attempts WHERE attempts.task_id=tasks.id AND attempts.role=tasks.role) < 3")
+}
