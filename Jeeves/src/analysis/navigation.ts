@@ -46,11 +46,12 @@ export class Navigation {
       if (parsed.generation !== generation || parsed.query !== query || typeof parsed.position?.file !== 'string' || !Number.isInteger(parsed.position.ordinal) || parsed.position.ordinal < -1) throw new Error('stale_or_foreign_cursor')
       position = parsed.position
     }
-    if (context.language !== 'tsjs') return { rows: [], cursor: null, capability: 'semantic_partial', completion: 'blocked', reasons: ['csharp_reverse_resolution_not_available'] }
     const key = hash(JSON.stringify([query, generation, position, limit]))
     const cached = (await this.store.query('SELECT data FROM semantic_results WHERE key=?', [key]))[0]
     if (cached) return JSON.parse(String(cached.data))
-    const resolved = await this.workspaces.callers(project, functionId, position, limit) as Record<string, unknown>
+    const resolved = (context.language === 'csharp'
+      ? await this.csharp.request('callers', { project, targetId: functionId, cursor: position, limit })
+      : await this.workspaces.callers(project, functionId, position, limit)) as Record<string, unknown>
     const result = { ...resolved, generation, searchedProject: project,
       cursor: resolved.cursor ? Buffer.from(JSON.stringify({ generation, query, position: resolved.cursor })).toString('base64url') : null }
     await this.store.execute('INSERT OR REPLACE INTO semantic_results VALUES (?,?,?)', [key, project, JSON.stringify(result)])

@@ -19,9 +19,12 @@ test('Roslyn sidecar masks comments, indexes calls and resolves a local implemen
     assert.ok(read.text.includes('https://example.test/*literal*/'))
     const result = await client.request('analyze', { file: 'Example.cs' }) as { calls: Array<{ name: string, start: number }> }
     assert.equal(result.calls[0]?.name, 'Target')
-    const resolved = await client.request('resolve', { project: 'Example.csproj', file: 'Example.cs', start: result.calls[0]!.start }) as { targets: Array<{ file: string, implementation: boolean }>, reasons: string[] }
+    const resolved = await client.request('resolve', { project: 'Example.csproj', file: 'Example.cs', start: result.calls[0]!.start }) as { targets: Array<{ id: string, file: string, implementation: boolean }>, reasons: string[] }
     assert.ok(resolved.targets.some(target => target.file === 'Example.cs' && target.implementation))
     assert.ok(resolved.reasons.includes('build_conditions_not_evaluated'))
+    const reverse = await client.request('callers', { project: 'Example.csproj', targetId: resolved.targets[0]!.id, limit: 10 }) as { rows: Array<{ file: string }>, reasons: string[] }
+    assert.equal(reverse.rows[0]?.file, 'Example.cs')
+    assert.ok(reverse.reasons.includes('dynamic_dispatch_not_exhaustive'))
     const methodStart = source.indexOf('static string Target')
     const methodEnd = source.indexOf('} static') + 1
     const local = await client.request('local', { file: 'Example.cs', start: methodStart, end: methodEnd }) as { blocks: unknown[] }

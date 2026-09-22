@@ -177,6 +177,7 @@ internal static class Program
             compilation = CSharpCompilation.Create("Snapshot", trees, [reference], new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
             loadedProject = project;
         }
+        if (request.GetProperty("method").GetString() == "callers") return FindCallers(request);
         var sourceFile = SafeFile(request.GetProperty("file").GetString()!);
         var tree = compilation.SyntaxTrees.FirstOrDefault(tree => tree.FilePath == sourceFile) ?? throw new InvalidOperationException("file_not_in_project");
         var start = request.GetProperty("start").GetInt32();
@@ -196,6 +197,50 @@ internal static class Program
             reasons = new[] { "declarative_project_membership", "build_conditions_not_evaluated", "package_references_not_loaded", "dynamic_dispatch_not_exhaustive" } };
     }
 
+    private static object FindCallers(JsonElement request)
+    {
+        var targetId = request.GetProperty("targetId").GetString();
+        var limit = request.GetProperty("limit").GetInt32();
+        if (limit < 1 || limit > 50) throw new InvalidOperationException("invalid_caller_request");
+        string? cursorFile = null; var cursorOrdinal = -1;
+        if (request.TryGetProperty("cursor", out var cursor) && cursor.ValueKind == JsonValueKind.Object)
+        {
+            cursorFile = cursor.GetProperty("file").GetString(); cursorOrdinal = cursor.GetProperty("ordinal").GetInt32();
+        }
+        var rows = new List<object>(); var examined = 0; var unresolved = 0; var fileCount = 0;
+        string? lastFile = cursorFile; var lastOrdinal = cursorOrdinal;
+        object Page(bool exhausted) => new { rows, examined, unresolved, exhausted,
+            cursor = exhausted || lastFile == null ? null : new { file = lastFile, ordinal = lastOrdinal },
+            capability = "semantic_partial", completion = "partial",
+            reasons = new[] { "unsearched_projects_and_external_consumers", "build_conditions_not_evaluated", "package_references_not_loaded", "dynamic_dispatch_not_exhaustive" } };
+        foreach (var tree in compilation!.SyntaxTrees.OrderBy(tree => tree.FilePath, StringComparer.Ordinal))
+        {
+            var relative = Path.GetRelativePath(root, tree.FilePath).Replace('\\', '/');
+            if (cursorFile != null && StringComparer.Ordinal.Compare(relative, cursorFile) < 0) continue;
+            if (fileCount++ >= 10) return Page(false);
+            var semantic = compilation.GetSemanticModel(tree); var ordinal = 0;
+            foreach (var node in tree.GetRoot().DescendantNodes().Where(node => node is InvocationExpressionSyntax or ObjectCreationExpressionSyntax))
+            {
+                var current = ordinal++;
+                if (relative == cursorFile && current <= cursorOrdinal) continue;
+                if (examined >= 500 || rows.Count >= limit) return Page(false);
+                examined++; lastFile = relative; lastOrdinal = current;
+                var info = semantic.GetSymbolInfo(node);
+                var symbols = info.Symbol == null ? info.CandidateSymbols : [info.Symbol];
+                var references = symbols.SelectMany(symbol => symbol.DeclaringSyntaxReferences).ToArray();
+                if (references.Length == 0) unresolved++;
+                if (!references.Any(reference => $"{Path.GetRelativePath(root, reference.SyntaxTree.FilePath).Replace('\\', '/')}:{reference.Span.Start}-{reference.Span.End}" == targetId)) continue;
+                var owner = node.Ancestors().FirstOrDefault(candidate => IsFunction(candidate) && HasBody(candidate));
+                var arguments = node is InvocationExpressionSyntax call ? call.ArgumentList.Arguments : ((ObjectCreationExpressionSyntax)node).ArgumentList?.Arguments ?? default;
+                rows.Add(new { id = $"{relative}:{node.SpanStart}-{node.Span.End}", file = relative, start = node.SpanStart, end = node.Span.End,
+                    callerId = owner == null ? null : $"{relative}:{owner.SpanStart}-{owner.Span.End}", targetId, basis = "compiler_resolved_candidate",
+                    arguments = arguments.Take(100).Select(argument => new { start = argument.Expression.SpanStart, end = argument.Expression.Span.End }).ToArray() });
+            }
+            lastFile = relative; lastOrdinal = Math.Max(-1, ordinal - 1);
+        }
+        return Page(true);
+    }
+
     private static async Task Main()
     {
         string? line;
@@ -210,7 +255,7 @@ internal static class Program
                 var requestedRoot = Path.GetFullPath(request.GetProperty("root").GetString()!);
                 if (root != requestedRoot) { root = requestedRoot; compilation = null; loadedProject = ""; }
                 var method = request.GetProperty("method").GetString();
-                var result = method == "resolve" ? Resolve(request) : Analyze(request);
+                var result = method is "resolve" or "callers" ? Resolve(request) : Analyze(request);
                 var output = JsonSerializer.Serialize(new { id, value = result }, JsonOptions);
                 if (output.Length > 8 * 1024 * 1024) throw new InvalidOperationException("result_size_limit");
                 await Console.Out.WriteLineAsync(output);

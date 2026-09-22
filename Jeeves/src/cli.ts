@@ -27,7 +27,7 @@ export async function main (args = process.argv.slice(2)): Promise<void> {
 
 doctor
 import --dataset <directory> --repo <root> --run <directory>
-index --run <directory> [--semantic-project <tsconfig-or-csproj>]
+index --run <directory> [--reuse-run <previous-run>] [--semantic-project <tsconfig-or-csproj>]
 plan --run <directory> [--max-operations 25]
 run --run <directory> --model <model> --allow-live [--workers 2] [--config <limits.json>]
 resume --run <directory> --model <model> --allow-live [--retry-failed]
@@ -44,6 +44,7 @@ Source is transmitted only by an explicitly approved live run. No command pushes
     dataset: { type: 'string' }, repo: { type: 'string' }, run: { type: 'string' },
     config: { type: 'string' }, model: { type: 'string' }, workers: { type: 'string' },
     'max-operations': { type: 'string' }, 'semantic-project': { type: 'string' },
+    'reuse-run': { type: 'string' },
     'recover-lock': { type: 'boolean' }, 'allow-live': { type: 'boolean' }, 'retry-failed': { type: 'boolean' },
     approval: { type: 'string' }, 'validation-plan': { type: 'string' }, 'approve-execution': { type: 'boolean' }
   } })
@@ -62,7 +63,7 @@ Source is transmitted only by an explicitly approved live run. No command pushes
   }
   if (command === 'resume' && values['recover-lock']) { await recoverLock(run); console.log('lock_recovered'); return }
   if (command === 'index') {
-    console.log(JSON.stringify(await buildIndex(run), null, 2))
+    console.log(JSON.stringify(await buildIndex(run, values['reuse-run']), null, 2))
     if (values['semantic-project']) {
       const store = await Store.open(run); const navigation = new Navigation(store, limits)
       try {
