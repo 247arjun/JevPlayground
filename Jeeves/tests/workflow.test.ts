@@ -12,7 +12,14 @@ import { runInvestigations } from '../src/orchestration/run.js'
 import { Store } from '../src/storage/store.js'
 import { Gateway } from '../src/tools/gateway.js'
 import { report } from '../src/reporting.js'
-import type { AgentResult } from '../src/domain.js'
+import { defaultLimits, type AgentResult } from '../src/domain.js'
+
+async function invokeTool (gateway: Gateway, name: string, input: unknown): Promise<Record<string, unknown>> {
+  const tool = gateway.tools().find(tool => tool.name === name)
+  assert.ok(tool?.handler)
+  const invocation = { sessionId: 'test', toolCallId: name, toolName: name, arguments: input }
+  return await tool.handler(input, invocation) as Record<string, unknown>
+}
 
 test('role workflow persists verified evidence and reports without live models', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-workflow-'))
@@ -68,6 +75,93 @@ test('result citations must be observed, in range and inside the selected functi
       await assert.rejects(gateway.accept(result), /citation_not_observed/)
       gateway.close()
       await assert.rejects(gateway.read('code.ts', 0, 1), /attempt_closed/)
+    } finally { navigation.close(); await store.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('retrieval exhaustion reserves the final tool call for a validated result', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-finalize-'))
+  try {
+    const paths = await fixture(root); await importDataset(paths.dataset, paths.source, paths.run)
+    const store = await Store.open(paths.run); const navigation = new Navigation(store)
+    try {
+      const fn = (await store.query('SELECT * FROM functions'))[0]!
+      const gateway = new Gateway(store, navigation, { id: 'test', role: 'localizer', function_id: String(fn.id) }, { ...defaultLimits, maxToolCalls: 2 })
+      const evidence = await invokeTool(gateway, 'read_source', { file: 'code.ts', start: 0, end: Number(fn.end) })
+      const citation = { file: 'code.ts', start: 0, end: Number(fn.end), sourceHash: String(evidence.sourceHash) }
+      assert.equal((evidence.budget as Record<string, unknown>).nextAction, 'submit_result')
+      assert.equal((await invokeTool(gateway, 'read_source', { file: 'code.ts', start: 0, end: 1 })).error, 'retrieval_budget_exhausted')
+      const result: AgentResult = { disposition: 'needs_context', summary: 'Caller context remains unresolved.', invariant: 'Establish the caller boundary.', operation: citation, facts: [{ text: 'The function returns its argument.', citations: [citation] }], assumptions: [], counterevidence: [], unresolved: ['Caller context was not retrieved within budget.'] }
+      assert.equal((await invokeTool(gateway, 'submit_result', result)).accepted, true)
+      assert.deepEqual(gateway.accepted, result)
+      assert.equal(gateway.usage().toolCalls, 2)
+      assert.equal(gateway.usage().rejectedToolCalls, 1)
+      assert.deepEqual(gateway.usage().toolErrors, { retrieval_budget_exhausted: 1 })
+    } finally { navigation.close(); await store.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('read_source returns actual EOF spans and cancellation prevents late acceptance', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-source-window-'))
+  try {
+    const paths = await fixture(root); await importDataset(paths.dataset, paths.source, paths.run)
+    const store = await Store.open(paths.run); const navigation = new Navigation(store)
+    try {
+      const fn = (await store.query('SELECT * FROM functions'))[0]!
+      const gateway = new Gateway(store, navigation, { id: 'test', role: 'localizer', function_id: String(fn.id) })
+      const evidence = await invokeTool(gateway, 'read_source', { file: 'code.ts', start: 0, end: Number(fn.end) + 1000 })
+      assert.equal(evidence.end, Number(fn.end))
+      assert.equal(evidence.fileLength, Number(fn.end))
+      const invalid = await invokeTool(gateway, 'read_source', { file: 'code.ts', start: Number(fn.end), end: Number(fn.end) + 1 })
+      assert.equal(invalid.error, 'invalid_source_span')
+      assert.equal(invalid.fileLength, Number(fn.end))
+      const citation = { file: 'code.ts', start: 0, end: Number(fn.end), sourceHash: String(evidence.sourceHash) }
+      const pending = gateway.accept({ disposition: 'needs_context', summary: 'Unresolved caller.', invariant: 'Check callers.', operation: citation, facts: [{ text: 'Returns an argument.', citations: [citation] }], assumptions: [], counterevidence: [], unresolved: [] })
+      gateway.close()
+      await assert.rejects(pending, /result_already_submitted/)
+      assert.equal(gateway.accepted, undefined)
+    } finally { navigation.close(); await store.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('provider reserve stops retrieval but does not bypass result validation', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-provider-reserve-'))
+  try {
+    const paths = await fixture(root); await importDataset(paths.dataset, paths.source, paths.run)
+    const store = await Store.open(paths.run); const navigation = new Navigation(store)
+    try {
+      const fn = (await store.query('SELECT * FROM functions'))[0]!
+      const gateway = new Gateway(store, navigation, { id: 'test', role: 'localizer', function_id: String(fn.id) }, { ...defaultLimits, maxProviderRequests: 3 })
+      gateway.recordUsage({ id: 'first', model: 'test' })
+      assert.equal((await invokeTool(gateway, 'read_source', { file: 'code.ts', start: 0, end: 1 })).error, 'finalization_required')
+      const citation = { file: 'code.ts', start: 0, end: Number(fn.end), sourceHash: '0'.repeat(64) }
+      const invalid = { disposition: 'supported_candidate', summary: 'Unobserved claim.', invariant: 'Claim', operation: citation, facts: [{ text: 'Not read.', citations: [citation] }], assumptions: [], counterevidence: [], unresolved: [] }
+      assert.equal((await invokeTool(gateway, 'submit_result', invalid)).error, 'citation_not_observed')
+      assert.equal(gateway.accepted, undefined)
+      assert.equal((await invokeTool(gateway, 'submit_result', {})).error, 'invalid_result_schema')
+      const result: AgentResult = { disposition: 'budget_exhausted', summary: 'Insufficient evidence within budget.', invariant: '', operation: null, facts: [], assumptions: [], counterevidence: [], unresolved: ['No source was retrieved.'] }
+      assert.equal((await invokeTool(gateway, 'submit_result', result)).accepted, true)
+      assert.deepEqual(gateway.accepted, result)
+    } finally { navigation.close(); await store.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('source withheld by the byte limit is not valid citation evidence', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-withheld-source-'))
+  try {
+    const paths = await fixture(root); await importDataset(paths.dataset, paths.source, paths.run)
+    const store = await Store.open(paths.run); const navigation = new Navigation(store)
+    try {
+      const fn = (await store.query('SELECT * FROM functions'))[0]!
+      const gateway = new Gateway(store, navigation, { id: 'test', role: 'localizer', function_id: String(fn.id) }, { ...defaultLimits, maxResultBytes: 1024 })
+      const read = gateway.read.bind(gateway)
+      gateway.read = async (...args) => ({ ...await read(...args), padding: 'x'.repeat(1024) })
+      const evidence = await invokeTool(gateway, 'read_source', { file: 'code.ts', start: 0, end: Number(fn.end) })
+      assert.equal(evidence.error, 'context_byte_budget_exhausted')
+      const citation = { file: 'code.ts', start: 0, end: Number(fn.end), sourceHash: String(fn.source_hash) }
+      await assert.rejects(gateway.accept({ disposition: 'needs_context', summary: 'Unobserved claim.', invariant: 'Claim', operation: citation, facts: [{ text: 'Not delivered.', citations: [citation] }], assumptions: [], counterevidence: [], unresolved: [] }), /citation_not_observed/)
+      const result: AgentResult = { disposition: 'budget_exhausted', summary: 'The source did not fit.', invariant: '', operation: null, facts: [], assumptions: [], counterevidence: [], unresolved: ['Source not observed within budget.'] }
+      assert.equal((await invokeTool(gateway, 'submit_result', result)).accepted, true)
     } finally { navigation.close(); await store.close() }
   } finally { await rm(root, { recursive: true, force: true }) }
 })
