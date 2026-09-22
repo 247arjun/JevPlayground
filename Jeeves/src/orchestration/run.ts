@@ -1,0 +1,45 @@
+import path from 'node:path'
+import { defaultLimits, type FunctionRecord, type Limits, type Row } from '../domain.js'
+import { errorCode } from '../security.js'
+import { Store, getArtifact, putArtifact } from '../storage/store.js'
+import { withRunLock } from '../storage/lock.js'
+import { Navigation } from '../analysis/navigation.js'
+import { Gateway } from '../tools/gateway.js'
+import type { AgentBackend } from '../agents/runner.js'
+import { claimTask, failTask, finishTask, recoverTasks } from './tasks.js'
+
+export async function runInvestigations (run: string, backend: AgentBackend, workers = 2, limits: Limits = defaultLimits, signal = new AbortController().signal): Promise<Record<string, unknown>> {
+  if (!Number.isInteger(workers) || workers < 1 || workers > 8) throw new Error('invalid_worker_count')
+  return await withRunLock(run, async () => {
+    const store = await Store.open(run); const navigation = new Navigation(store)
+    try {
+      if (!await store.get('planHash') || !await store.get('indexGeneration')) throw new Error('plan_not_ready')
+      await recoverTasks(store)
+      async function work (): Promise<void> {
+        while (!signal.aborted) {
+          const task = await claimTask(store, limits.modelTimeoutMs + 30000, limits.maxModelCalls)
+          if (!task) return
+          const gateway = new Gateway(store, navigation, task, limits)
+          try {
+            const row = (await store.query('SELECT * FROM functions WHERE id=?', [String(task.function_id)]))[0]!
+            const fn = await getArtifact<FunctionRecord>(run, String(row.artifact))
+            const classification = row.classification_artifact ? await getArtifact(run, String(row.classification_artifact)) : null
+            const prior = task.result ? await getArtifact(run, String(task.result)) : null
+            const context = { task: { id: task.id, attempt: task.attempt, role: task.role, theme: task.theme, codePurpose: task.purpose }, function: { id: fn.id, file: fn.file, start: fn.start, end: fn.end, name: fn.name }, classification, prior, instructions: 'Use read_source for cited code; do not assume classification labels establish related flows.' }
+            const requestHash = await putArtifact(run, context)
+            await store.execute('UPDATE attempts SET request_artifact=? WHERE id=?', [requestHash, String(task.attempt)])
+            await backend.execute(task, context, gateway, signal)
+            if (!gateway.accepted) throw new Error('missing_structured_result')
+            const result = { ...gateway.accepted, role: task.role, taskId: task.id, attempt: task.attempt, observedAt: new Date().toISOString(), usage: gateway.usage(), promptVersion: 'roles-v1', modelEvidenceNotRuntimeProof: true }
+            const resultHash = await putArtifact(run, result)
+            await finishTask(store, task, resultHash, gateway.accepted)
+          } catch (error) {
+            await failTask(store, task, errorCode(error))
+          } finally { gateway.close() }
+        }
+      }
+      await Promise.all(Array.from({ length: workers }, () => work()))
+      return { tasks: await store.query('SELECT state,COUNT(*) AS count FROM tasks GROUP BY state'), modelCalls: await store.get('modelCalls'), compiler: navigation.workspaces.metrics, aborted: signal.aborted, maxModelCalls: limits.maxModelCalls }
+    } finally { navigation.close(); await store.close() }
+  })
+}

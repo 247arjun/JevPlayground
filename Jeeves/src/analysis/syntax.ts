@@ -6,6 +6,34 @@ export function implementation (node: ts.Node): node is ts.FunctionDeclaration |
   return (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isMethodDeclaration(node) || ts.isConstructorDeclaration(node) || ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)) && Boolean(node.body)
 }
 
+export function maskComments (file: string, source: string): string {
+  const parsed = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, parsed.languageVariant)
+  const ranges: Array<{ start: number, end: number }> = []
+  let cursor = 0
+  const gap = (start: number, end: number) => {
+    if (end <= start) return
+    scanner.setText(source, start, end - start)
+    for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
+      if (token === ts.SyntaxKind.SingleLineCommentTrivia || token === ts.SyntaxKind.MultiLineCommentTrivia) ranges.push({ start: scanner.getTokenPos(), end: scanner.getTextPos() })
+    }
+  }
+  const visit = (node: ts.Node) => {
+    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return
+    if (node.kind >= ts.SyntaxKind.FirstToken && node.kind <= ts.SyntaxKind.LastToken) {
+      gap(cursor, ts.isJsxText(node) ? node.getFullStart() : node.getStart(parsed)); cursor = node.getEnd(); return
+    }
+    for (const child of node.getChildren(parsed)) visit(child)
+  }
+  visit(parsed); gap(cursor, source.length)
+  const pieces: string[] = []; cursor = 0
+  for (const range of ranges) {
+    pieces.push(source.slice(cursor, range.start), source.slice(range.start, range.end).replace(/[^\r\n\u2028\u2029]/g, ' ')); cursor = range.end
+  }
+  pieces.push(source.slice(cursor))
+  return pieces.join('')
+}
+
 export function syntaxIndex (file: string, source: string): { calls: Site[], registrations: Registration[], diagnostics: string[] } {
   const parsed = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
   const calls: Site[] = []

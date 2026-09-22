@@ -11,6 +11,10 @@ import { buildIndex } from './analysis/index.js'
 import { Navigation } from './analysis/navigation.js'
 import { planTasks } from './orchestration/tasks.js'
 import { withRunLock } from './storage/lock.js'
+import { createClient, stopClient } from './copilot/client.js'
+import { CopilotBackend } from './agents/runner.js'
+import { runInvestigations } from './orchestration/run.js'
+import { report } from './reporting.js'
 
 export async function main (args = process.argv.slice(2)): Promise<void> {
   const command = args[0]
@@ -54,6 +58,22 @@ export async function main (args = process.argv.slice(2)): Promise<void> {
   if (command === 'status') {
     const store = await Store.open(run)
     try { console.log(JSON.stringify({ manifest: await store.get('manifest'), importComplete: await store.get('importComplete'), tasks: await store.query('SELECT state,COUNT(*) AS count FROM tasks GROUP BY state') }, null, 2)) } finally { await store.close() }
+    return
+  }
+  if (command === 'report') { console.log(JSON.stringify(await report(run), null, 2)); return }
+  if (command === 'run' || command === 'resume') {
+    if (!values['allow-live']) throw new Error('live_source_disclosure_requires_allow_live')
+    if (!values.model) throw new Error('explicit_model_required')
+    const client = await createClient(run)
+    const controller = new AbortController()
+    const cancel = () => controller.abort()
+    process.once('SIGINT', cancel); process.once('SIGTERM', cancel)
+    try {
+      const models = await client.listModels()
+      if (!models.some(model => model.id === values.model)) throw new Error('model_unavailable')
+      console.log(JSON.stringify(await runInvestigations(run, new CopilotBackend(client, values.model, run), values.workers ? Number(values.workers) : 2, undefined, controller.signal), null, 2))
+      await report(run)
+    } finally { process.off('SIGINT', cancel); process.off('SIGTERM', cancel); await stopClient(client) }
     return
   }
   throw new Error('unknown_command')
