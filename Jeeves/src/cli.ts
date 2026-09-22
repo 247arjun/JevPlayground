@@ -7,6 +7,10 @@ import { importDataset } from './datasets/import.js'
 import { Store } from './storage/store.js'
 import { recoverLock } from './storage/lock.js'
 import { errorCode } from './security.js'
+import { buildIndex } from './analysis/index.js'
+import { Navigation } from './analysis/navigation.js'
+import { planTasks } from './orchestration/tasks.js'
+import { withRunLock } from './storage/lock.js'
 
 export async function main (args = process.argv.slice(2)): Promise<void> {
   const command = args[0]
@@ -29,6 +33,24 @@ export async function main (args = process.argv.slice(2)): Promise<void> {
     console.log(JSON.stringify(await importDataset(values.dataset, values.repo, run), null, 2)); return
   }
   if (command === 'resume' && values['recover-lock']) { await recoverLock(run); console.log('lock_recovered'); return }
+  if (command === 'index') {
+    console.log(JSON.stringify(await buildIndex(run), null, 2))
+    if (values['semantic-project']) {
+      const store = await Store.open(run); const navigation = new Navigation(store)
+      try {
+        const call = (await store.query('SELECT file,start FROM calls ORDER BY id LIMIT 1'))[0]
+        if (call) console.log(JSON.stringify(await navigation.resolve(String(call.file), Number(call.start), values['semantic-project']), null, 2))
+      } finally { navigation.close(); await store.close() }
+    }
+    return
+  }
+  if (command === 'plan') {
+    await withRunLock(run, async () => {
+      const store = await Store.open(run)
+      try { console.log(JSON.stringify(await planTasks(store, values['max-operations'] ? Number(values['max-operations']) : 25), null, 2)) } finally { await store.close() }
+    })
+    return
+  }
   if (command === 'status') {
     const store = await Store.open(run)
     try { console.log(JSON.stringify({ manifest: await store.get('manifest'), importComplete: await store.get('importComplete'), tasks: await store.query('SELECT state,COUNT(*) AS count FROM tasks GROUP BY state') }, null, 2)) } finally { await store.close() }
