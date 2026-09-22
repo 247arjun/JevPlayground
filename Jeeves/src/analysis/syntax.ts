@@ -51,6 +51,7 @@ export function syntaxIndex (file: string, source: string): { calls: Site[], reg
   function visit (node: ts.Node, parentId: string | null) {
     if (implementation(node)) parentId = `${file}:${node.getStart(parsed)}-${node.getEnd()}`
     if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      if (calls.length >= 20000) throw new Error('syntax_site_limit')
       const expression = node.expression
       const name = ts.isIdentifier(expression) ? expression.text : ts.isPropertyAccessExpression(expression) ? expression.name.text : '<computed>'
       const start = node.getStart(parsed)
@@ -59,6 +60,7 @@ export function syntaxIndex (file: string, source: string): { calls: Site[], reg
       while (ts.isPropertyAccessExpression(base)) base = base.expression
       const module = ts.isIdentifier(base) ? imports.get(base.text) : undefined
       const callbacks = (node.arguments ?? []).filter(implementation).map(callback => ({ start: callback.getStart(parsed), end: callback.getEnd() }))
+      if ((node.arguments?.length ?? 0) > 1000) throw new Error('syntax_argument_limit')
       const data = { arguments: (node.arguments ?? []).map(argument => ({ start: argument.getStart(parsed), end: argument.getEnd() })), module: module ?? null, callbacks, kind: ts.isNewExpression(node) ? 'constructor' : 'call', resolution: 'unresolved' }
       calls.push({ id, file, start, end: node.getEnd(), callerId: parentId, name, expression: expression.getText(parsed).slice(0, 1024), data })
       if (callbacks.length || module === '@azure/functions' || ['get', 'post', 'use', 'MapGet', 'MapPost', 'on'].includes(name)) {

@@ -1,5 +1,4 @@
-import path from 'node:path'
-import { defaultLimits, type FunctionRecord, type Limits, type Row } from '../domain.js'
+import { defaultLimits, type FunctionRecord, type Limits } from '../domain.js'
 import { errorCode } from '../security.js'
 import { Store, getArtifact, putArtifact } from '../storage/store.js'
 import { withRunLock } from '../storage/lock.js'
@@ -11,7 +10,7 @@ import { claimTask, failTask, finishTask, recoverTasks } from './tasks.js'
 export async function runInvestigations (run: string, backend: AgentBackend, workers = 2, limits: Limits = defaultLimits, signal = new AbortController().signal): Promise<Record<string, unknown>> {
   if (!Number.isInteger(workers) || workers < 1 || workers > 8) throw new Error('invalid_worker_count')
   return await withRunLock(run, async () => {
-    const store = await Store.open(run); const navigation = new Navigation(store)
+    const store = await Store.open(run); const navigation = new Navigation(store, limits)
     try {
       if (!await store.get('planHash') || !await store.get('indexGeneration')) throw new Error('plan_not_ready')
       const identity = backend.identity ?? { provider: 'test', model: 'fake', promptVersion: 'test' }
@@ -20,8 +19,9 @@ export async function runInvestigations (run: string, backend: AgentBackend, wor
       await store.set('agentIdentity', identity)
       await store.set('limits', limits)
       await recoverTasks(store)
+      let blockReason: string | null = null
       async function work (): Promise<void> {
-        while (!signal.aborted) {
+        while (!signal.aborted && !blockReason) {
           const task = await claimTask(store, limits.modelTimeoutMs + 30000, limits.maxModelCalls)
           if (!task) return
           const gateway = new Gateway(store, navigation, task, limits)
@@ -39,12 +39,16 @@ export async function runInvestigations (run: string, backend: AgentBackend, wor
             const resultHash = await putArtifact(run, result)
             await finishTask(store, task, resultHash, gateway.accepted)
           } catch (error) {
-            await failTask(store, task, errorCode(error))
+            const code = errorCode(error)
+            await failTask(store, task, code)
+            await store.execute("INSERT INTO events(task_id,kind,data,time) VALUES (?,'attempt_failed',?,?)", [String(task.id), JSON.stringify({ code, attempt: task.attempt, usage: gateway.usage() }), Date.now()])
+            if (['provider_authentication_failed', 'provider_billing_blocked', 'provider_rate_limited', 'provider_unavailable'].includes(code)) blockReason = code
           } finally { gateway.close() }
         }
       }
       await Promise.all(Array.from({ length: workers }, () => work()))
-      return { tasks: await store.query('SELECT state,COUNT(*) AS count FROM tasks GROUP BY state'), modelCalls: await store.get('modelCalls'), compiler: navigation.workspaces.metrics, aborted: signal.aborted, maxModelCalls: limits.maxModelCalls }
+      await store.set('blockReason', blockReason)
+      return { tasks: await store.query('SELECT state,COUNT(*) AS count FROM tasks GROUP BY state'), modelCalls: await store.get('modelCalls'), compiler: navigation.workspaces.metrics, aborted: signal.aborted, blockReason, maxModelCalls: limits.maxModelCalls }
     } finally { navigation.close(); await store.close() }
   })
 }

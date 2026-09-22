@@ -62,6 +62,8 @@ export const limitsSchema = z.object({
   maxResultBytes: z.number().int().min(1024).max(1024 * 1024).default(96 * 1024),
   maxToolCalls: z.number().int().min(1).max(100).default(40),
   maxModelCalls: z.number().int().min(1).max(1000).default(75),
+  maxProviderRequests: z.number().int().min(1).max(100).default(20),
+  maxAiCreditsPerSession: z.number().positive().optional(),
   modelTimeoutMs: z.number().int().min(1000).max(600000).default(120000),
   compilerTimeoutMs: z.number().int().min(1000).max(120000).default(30000),
   compilerMemoryMb: z.number().int().min(128).max(8192).default(512),

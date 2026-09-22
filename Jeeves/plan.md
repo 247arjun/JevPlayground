@@ -2,6 +2,8 @@
 
 Status: design only. No implementation, dependency installation, model calls, or target analysis is authorized by this document alone.
 
+Implementation note: a first working implementation now exists under this folder following separate user authorization. See `README.md` for executable commands, measured checks, and capability limitations. The stages and acceptance criteria below remain the intended destination, not a claim that all release gates have passed.
+
 ## 1. Objective
 
 Build a classification-guided, multi-agent security investigation system for C# and TypeScript/JavaScript services, with Azure-aware framework and deployment analysis.

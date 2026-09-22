@@ -20,16 +20,33 @@ export class CopilotBackend implements AgentBackend {
   get identity () { return { provider: 'github-copilot', model: this.model, promptVersion: 'roles-v1' } }
   constructor (private readonly client: CopilotClient, private readonly model: string, private readonly run: string, private readonly limits: Limits = defaultLimits) {}
   async execute (task: Row, context: unknown, gateway: Gateway, signal: AbortSignal): Promise<void> {
-    const session = await this.client.createSession(sessionConfiguration(path.join(this.run, 'runtime/work'), this.model, gateway.tools(), common + '\n' + roles[String(task.role)]))
+    const configuration = sessionConfiguration(path.join(this.run, 'runtime/work'), this.model, gateway.tools(), common + '\n' + roles[String(task.role)])
+    if (this.limits.maxAiCreditsPerSession) configuration.sessionLimits = { maxAiCredits: this.limits.maxAiCreditsPerSession }
+    const session = await bounded(this.client.createSession(configuration), 20000, () => this.client.forceStop())
     let aborted = false
+    let budgetExhausted = false
     const abort = () => { aborted = true; gateway.close(); void session.abort().catch(() => {}) }
+    const unsubscribe = session.on('assistant.usage', event => {
+      if (gateway.recordUsage({ id: event.id, model: event.data.model, inputTokens: event.data.inputTokens, outputTokens: event.data.outputTokens, cost: event.data.cost })) {
+        budgetExhausted = true; abort()
+      }
+    })
     signal.addEventListener('abort', abort, { once: true })
     try {
       if (signal.aborted) { abort(); throw new Error('cancelled') }
       await bounded(session.sendAndWait({ prompt: JSON.stringify(context) }, this.limits.modelTimeoutMs), this.limits.modelTimeoutMs, async () => { abort() })
       if (aborted) throw new Error('cancelled')
       if (!gateway.accepted) throw new Error('missing_structured_result')
+    } catch (error) {
+      if (budgetExhausted) throw new Error('provider_request_budget_exhausted')
+      if (error instanceof Error && /^[a-z_]+$/.test(error.message)) throw error
+      const message = error instanceof Error ? error.message : ''
+      if (/\b401\b|\b403\b|unauthori[sz]ed/i.test(message)) throw new Error('provider_authentication_failed')
+      if (/\b402\b|payment required|insufficient credits/i.test(message)) throw new Error('provider_billing_blocked')
+      if (/\b429\b|rate.limit/i.test(message)) throw new Error('provider_rate_limited')
+      throw new Error('provider_unavailable')
     } finally {
+      unsubscribe()
       signal.removeEventListener('abort', abort)
       gateway.close()
       try { await bounded(session.abort(), 5000, async () => {}); await bounded(session.disconnect(), 5000, async () => {}) } catch { /* Client shutdown is the final cleanup boundary. */ }

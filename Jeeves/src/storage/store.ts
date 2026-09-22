@@ -1,4 +1,4 @@
-import { lstat, mkdir, chmod, realpath } from 'node:fs/promises'
+import { lstat, mkdir, chmod } from 'node:fs/promises'
 import path from 'node:path'
 import { Worker } from 'node:worker_threads'
 import type { SQLInputValue } from 'node:sqlite'

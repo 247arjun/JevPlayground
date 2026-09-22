@@ -30,4 +30,8 @@ async function main (): Promise<void> {
     console.log(JSON.stringify({ status: 'passed', model, sessions: 2, customToolRoundTrip: true, repositorySourceSent: false }))
   } finally { await stopClient(client); await rm(root, { recursive: true, force: true }) }
 }
-main().catch(error => { console.error(errorCode(error)); process.exitCode = 1 })
+main().catch(error => {
+  const name = error instanceof Error && /^[A-Za-z]+$/.test(error.name) ? error.name : 'Error'
+  console.error(JSON.stringify({ error: errorCode(error), category: name, probe: 'isolated_custom_tool_round_trip' }))
+  process.exitCode = 1
+})

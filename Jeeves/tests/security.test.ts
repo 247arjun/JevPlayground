@@ -3,10 +3,10 @@ import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { atomicJson, errorCode, hash, readBounded, relativePath } from '../src/security.js'
+import { atomicJson, canonicalOutput, errorCode, hash, readBounded, relativePath } from '../src/security.js'
 
 test('path policy rejects traversal, platform escapes and symlinks', async () => {
-  for (const value of ['../outside', '/etc/passwd', 'C:/secrets', 'a\\b', 'a/../b', 'a//b', 'a\0b']) {
+  for (const value of ['../outside', '/etc/passwd', 'C:/secrets', 'a\\b', 'a/../b', 'a//b', 'a\0b', 'file:stream']) {
     assert.throws(() => relativePath(value), /invalid_relative_path/)
   }
   const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-path-'))
@@ -17,6 +17,7 @@ test('path policy rejects traversal, platform escapes and symlinks', async () =>
     await assert.rejects(readBounded(root, 'source/code.ts', 2), /file_size_limit/)
     await symlink(path.join(root, 'source'), path.join(root, 'link'))
     await assert.rejects(readBounded(root, 'link/code.ts', 100), /symlink_not_allowed/)
+    assert.equal(await canonicalOutput(path.join(root, 'link/new/output')), path.join(await canonicalOutput(path.join(root, 'source')), 'new/output'))
     await atomicJson(path.join(root, 'result.json'), { complete: true })
     assert.deepEqual(JSON.parse((await readBounded(root, 'result.json', 100)).toString()), { complete: true })
   } finally { await rm(root, { recursive: true, force: true }) }

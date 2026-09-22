@@ -14,6 +14,7 @@ export class Gateway {
   private bytes = 0
   private closed = false
   private served: Citation[] = []
+  private providerUsage: Array<{ id: string, model: string, inputTokens: number | null, outputTokens: number | null, costMultiplier: number | null }> = []
   private sourceCache?: { file: string, hash: string, original: string, sanitized: string }
   accepted?: AgentResult
   constructor (readonly store: Store, readonly navigation: Navigation, readonly task: Row, readonly limits: Limits = defaultLimits) {}
@@ -100,7 +101,10 @@ export class Gateway {
       defineTool('resolve_call', { description: 'Resolve one indexed call in an explicitly selected project. Returned targets remain candidates; missing dependencies are reported.', parameters: z.object({ file: z.string(), start: z.number().int().nonnegative(), project: z.string() }).strict(), handler: wrap(async input => await this.navigation.resolve(input.file, input.start, input.project)) }),
       defineTool('list_projects', { description: 'Page project configuration IDs for semantic resolution.', parameters: z.object({ after: z.string().default('') }).strict(), handler: wrap(async input => ({ projects: await this.store.query('SELECT * FROM projects WHERE id>? ORDER BY id LIMIT 50', [input.after]), completion: 'partial', reason: 'Use last ID to continue until an empty page' })) }),
       defineTool('inspect_local', { description: 'Locate candidate definitions, operations, and control conditions. This is syntax evidence, not a taint or guard proof.', parameters: z.object({ file: z.string(), start: z.number().int().nonnegative(), end: z.number().int().positive() }).strict(), handler: wrap(async input => await this.navigation.inspect(input.file, input.start, input.end)) }),
-      defineTool('inspect_framework', { description: 'Inspect import-linked framework/API and declared Azure configuration evidence. Does not inspect live Azure or certify authorization.', parameters: z.object({ file: z.string() }).strict(), handler: wrap(async input => frameworkEvidence(input.file, (await this.source(input.file)).sanitized)) }),
+      defineTool('inspect_framework', { description: 'Inspect import-linked framework/API and declared Azure configuration evidence. Does not inspect live Azure or certify authorization.', parameters: z.object({ file: z.string() }).strict(), handler: wrap(async input => {
+        const source = await this.source(input.file)
+        return /\.cs$/.test(input.file) ? await this.navigation.csharp.request('framework', { file: input.file }) : frameworkEvidence(input.file, source.sanitized)
+      }) }),
       defineTool('search_snapshot', { description: 'Bounded literal search over snapshot files for unresolved relationships. Returns candidate locations; read them to verify.', parameters: z.object({ text: z.string().min(1).max(200), after: z.string().default('') }).strict(), handler: wrap(async input => {
         const files = await this.store.query('SELECT path FROM files WHERE path>? ORDER BY path LIMIT 30', [input.after])
         const matches: unknown[] = []
@@ -114,5 +118,9 @@ export class Gateway {
     ]
   }
   close (): void { this.closed = true; this.sourceCache = undefined }
-  usage (): Record<string, number> { return { toolCalls: this.calls, returnedBytes: this.bytes } }
+  recordUsage (value: { id: string, model: string, inputTokens?: number, outputTokens?: number, cost?: number }): boolean {
+    if (!this.providerUsage.some(item => item.id === value.id)) this.providerUsage.push({ id: value.id, model: value.model, inputTokens: value.inputTokens ?? null, outputTokens: value.outputTokens ?? null, costMultiplier: value.cost ?? null })
+    return this.providerUsage.length >= this.limits.maxProviderRequests
+  }
+  usage (): Record<string, unknown> { return { toolCalls: this.calls, returnedBytes: this.bytes, providerCalls: this.providerUsage, tokenUsageComplete: this.providerUsage.length > 0 && this.providerUsage.every(item => item.inputTokens !== null && item.outputTokens !== null) } }
 }

@@ -8,11 +8,25 @@ export function hash (value: string | Uint8Array): string {
 }
 
 export function relativePath (value: string): string {
-  if (!value || value.includes('\0') || value.includes('\\') || path.isAbsolute(value) ||
+  if (!value || value.includes('\0') || value.includes('\\') || value.includes(':') || path.isAbsolute(value) ||
       /^[a-z]:/i.test(value) || value.split('/').some(part => !part || part === '.' || part === '..')) {
     throw new Error('invalid_relative_path')
   }
   return value
+}
+
+export async function canonicalOutput (file: string): Promise<string> {
+  let existing = path.resolve(file)
+  const suffix: string[] = []
+  while (true) {
+    try { return path.join(await realpath(existing), ...suffix) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      suffix.unshift(path.basename(existing))
+      const parent = path.dirname(existing)
+      if (parent === existing) throw new Error('output_parent_unavailable')
+      existing = parent
+    }
+  }
 }
 
 // Reject symlinks at every component, even links that currently point inside the

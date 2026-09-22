@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import path from 'node:path'
 import ts from 'typescript'
 import { implementation } from './syntax.js'
@@ -28,7 +28,7 @@ process.on('message', (message: { id: number, method: string, root: string, proj
       const host: ts.ParseConfigFileHost = {
         useCaseSensitiveFileNames: true,
         getCurrentDirectory: () => root,
-        readDirectory: (directory, extensions, excludes, includes, depth) => path.resolve(directory).startsWith(root) ? ts.sys.readDirectory(directory, extensions, excludes, includes, depth).filter(allowed) : [],
+        readDirectory: (directory, extensions, excludes, includes, depth) => (path.resolve(directory) === root || path.resolve(directory).startsWith(root + path.sep)) ? ts.sys.readDirectory(directory, extensions, excludes, includes, depth).filter(allowed) : [],
         fileExists: allowed,
         readFile: safeRead,
         onUnRecoverableConfigFileDiagnostic: () => { diagnostics.push('configuration_error') }

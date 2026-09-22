@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, rm, writeFile, chmod } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -44,7 +44,7 @@ export async function executeValidation (run: string, approvalId: string): Promi
   if (!/^[a-f0-9]{64}$/.test(approvalId)) throw new Error('invalid_approval_id')
   const raw = JSON.parse((await readBounded(run, `validations/${approvalId}/approval.json`, 65536)).toString()) as { plan: unknown, expiresAt: string, planHash: string }
   const plan = validationPlanSchema.parse(raw.plan)
-  if (raw.planHash !== hash(JSON.stringify(plan)) || raw.planHash !== approvalId || Date.parse(raw.expiresAt) <= Date.now()) throw new Error('invalid_or_expired_approval')
+  if (raw.planHash !== hash(JSON.stringify(plan)) || raw.planHash !== approvalId || !Number.isFinite(Date.parse(raw.expiresAt)) || Date.parse(raw.expiresAt) <= Date.now()) throw new Error('invalid_or_expired_approval')
   const store = await Store.open(run)
   try { if (await store.get('snapshotId') !== plan.snapshotId) throw new Error('validation_scope_mismatch') } finally { await store.close() }
   if (spawnSync('docker', ['info', '--format', '{{.ServerVersion}}'], { timeout: 5000, stdio: 'ignore' }).status !== 0) throw new Error('sandbox_unavailable')

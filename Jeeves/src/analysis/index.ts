@@ -6,15 +6,17 @@ import { Store, type Operation } from '../storage/store.js'
 import { withRunLock } from '../storage/lock.js'
 import { syntaxIndex } from './syntax.js'
 import { CSharp } from './csharp.js'
+import { SyntaxWorker } from './syntax-client.js'
 
 export async function buildIndex (run: string): Promise<Record<string, unknown>> {
   return await withRunLock(run, async () => {
     const store = await Store.open(run)
     const csharp = new CSharp(path.join(run, 'snapshot/source'))
+    const syntax = new SyntaxWorker(path.join(run, 'snapshot/source'))
     try {
       if (!await store.get('importComplete')) throw new Error('import_not_complete')
       const snapshotId = await store.get<string>('snapshotId')
-      const generation = hash(JSON.stringify([snapshotId, 'syntax-v2', ts.version, 'roslyn-4.11.0']))
+      const generation = hash(JSON.stringify([snapshotId, 'syntax-v3', ts.version, 'roslyn-4.11.0']))
       if (await store.get('indexGeneration') === generation) return { status: 'already_indexed', generation }
       await store.set('indexGeneration', null)
       await store.batch(['calls', 'registrations', 'projects', 'semantic_results', 'coverage'].map(table => ({ sql: `DELETE FROM ${table}` })))
@@ -35,7 +37,10 @@ export async function buildIndex (run: string): Promise<Record<string, unknown>>
             continue
           }
         } else if (file.language === 'tsjs') {
-          result = syntaxIndex(relative, bytes.toString())
+          try { result = await syntax.index(relative) } catch {
+            await store.execute('INSERT OR REPLACE INTO coverage VALUES (?,?,?)', [relative, 'unavailable', JSON.stringify(['syntax_resource_limit_or_failure'])])
+            continue
+          }
         } else {
           continue
         }
@@ -57,7 +62,7 @@ export async function buildIndex (run: string): Promise<Record<string, unknown>>
       await store.set('indexGeneration', generation)
       await store.set('indexStats', { files, calls: callCount, generation })
       return { status: 'indexed', files, calls: callCount, generation }
-    } finally { csharp.close(); await store.close() }
+    } finally { syntax.close(); csharp.close(); await store.close() }
   })
 }
 

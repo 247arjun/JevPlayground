@@ -37,7 +37,7 @@ export async function createClient (root: string): Promise<CopilotClient> {
   const client = new CopilotClient({ mode: 'empty', baseDirectory: home, workingDirectory, env,
     logLevel: 'error', enableRemoteSessions: false, useLoggedInUser: true,
     clientInfo: { applicationName: 'jeeves', applicationVersion: '0.1.0' } })
-  await client.start()
+  try { await bounded(client.start(), 20000, () => client.forceStop()) } catch (error) { await client.forceStop(); throw error }
   return client
 }
 

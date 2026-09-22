@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { z } from 'zod'
 import { classificationSchema, defaultLimits, digestSchema, functionSchema, questionsSchema, validateAnswers } from '../domain.js'
-import { atomicJson, containedFile, hash, readBounded, relativePath } from '../security.js'
+import { atomicJson, canonicalOutput, containedFile, hash, readBounded, relativePath } from '../security.js'
 import { Store, putArtifact, type Operation } from '../storage/store.js'
 import { withRunLock } from '../storage/lock.js'
 import { fileHash, jsonArray, jsonLines } from './stream.js'
@@ -16,7 +16,7 @@ const manifestSchema = z.object({
 }).passthrough()
 const inventoryFileSchema = z.object({ file: z.string(), sourceHash: digestSchema }).passthrough()
 const excluded = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.angular', '.cache', 'bin', 'obj'])
-const configPattern = /^(?:tsconfig[^/]*\.json|package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|host\.json|function\.json|global\.json|Directory\.[^.]+\.(?:props|targets)|[^/]+\.(?:csproj|sln|slnx|bicep|tf))$/i
+const configPattern = /^(?:tsconfig[^/]*\.json|package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|host\.json|function\.json|global\.json|appsettings(?:\.[^/]+)?\.json|azuredeploy(?:\.[^/]+)?\.json|Directory\.[^.]+\.(?:props|targets)|[^/]+\.(?:csproj|sln|slnx|bicep|tf))$/i
 
 async function * configurationFiles (root: string, relative = ''): AsyncGenerator<string> {
   for (const entry of await readdir(path.join(root, relative), { withFileTypes: true })) {
@@ -36,7 +36,7 @@ function purpose (file: string): string {
 export async function importDataset (datasetPath: string, sourcePath: string, runPath: string): Promise<Record<string, unknown>> {
   const dataset = await realpath(datasetPath)
   const source = await realpath(sourcePath)
-  const run = path.resolve(runPath)
+  const run = await canonicalOutput(runPath)
   if ([dataset, source].some(parent => run === parent || run.startsWith(parent + path.sep))) throw new Error('run_must_be_outside_inputs')
   await mkdir(run, { recursive: true, mode: 0o700 })
   return await withRunLock(run, async () => {

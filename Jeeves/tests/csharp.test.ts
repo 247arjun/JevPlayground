@@ -22,6 +22,13 @@ test('Roslyn sidecar masks comments, indexes calls and resolves a local implemen
     const resolved = await client.request('resolve', { project: 'Example.csproj', file: 'Example.cs', start: result.calls[0]!.start }) as { targets: Array<{ file: string, implementation: boolean }>, reasons: string[] }
     assert.ok(resolved.targets.some(target => target.file === 'Example.cs' && target.implementation))
     assert.ok(resolved.reasons.includes('build_conditions_not_evaluated'))
+    const methodStart = source.indexOf('static string Target')
+    const methodEnd = source.indexOf('} static') + 1
+    const local = await client.request('local', { file: 'Example.cs', start: methodStart, end: methodEnd }) as { blocks: unknown[] }
+    assert.ok(local.blocks.length > 0)
+    await writeFile(path.join(root, 'Endpoint.cs'), 'using Microsoft.AspNetCore.Authorization; class Endpoint { [Authorize] public void Handle() {} }')
+    const framework = await client.request('framework', { file: 'Endpoint.cs' }) as { facts: Array<{ name: string }> }
+    assert.equal(framework.facts[0]?.name, 'Authorize')
     await assert.rejects(client.request('analyze', { file: '../outside.cs' }), /invalid_relative_path/)
   } finally { client.close(); await rm(root, { recursive: true, force: true }) }
 })

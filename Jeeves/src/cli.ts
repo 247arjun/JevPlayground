@@ -22,6 +22,24 @@ import { approveValidation, executeValidation } from './validation.js'
 
 export async function main (args = process.argv.slice(2)): Promise<void> {
   const command = args[0]
+  if (!command || command === '--help' || command === 'help') {
+    console.log(`Jeeves: classification-guided security investigation
+
+doctor
+import --dataset <directory> --repo <root> --run <directory>
+index --run <directory> [--semantic-project <tsconfig-or-csproj>]
+plan --run <directory> [--max-operations 25]
+run --run <directory> --model <model> --allow-live [--workers 2] [--config <limits.json>]
+resume --run <directory> --model <model> --allow-live [--retry-failed]
+resume --run <directory> --recover-lock
+status --run <directory>
+report --run <directory>
+validate --run <directory> --validation-plan <file> --approve-execution
+validate --run <directory> --approval <id>
+
+Source is transmitted only by an explicitly approved live run. No command pushes code.`)
+    return
+  }
   const { values } = parseArgs({ args: args.slice(1), options: {
     dataset: { type: 'string' }, repo: { type: 'string' }, run: { type: 'string' },
     config: { type: 'string' }, model: { type: 'string' }, workers: { type: 'string' },
@@ -46,7 +64,7 @@ export async function main (args = process.argv.slice(2)): Promise<void> {
   if (command === 'index') {
     console.log(JSON.stringify(await buildIndex(run), null, 2))
     if (values['semantic-project']) {
-      const store = await Store.open(run); const navigation = new Navigation(store)
+      const store = await Store.open(run); const navigation = new Navigation(store, limits)
       try {
         const call = (await store.query('SELECT file,start FROM calls ORDER BY id LIMIT 1'))[0]
         if (call) console.log(JSON.stringify(await navigation.resolve(String(call.file), Number(call.start), values['semantic-project']), null, 2))
@@ -86,7 +104,9 @@ export async function main (args = process.argv.slice(2)): Promise<void> {
     try {
       const models = await client.listModels()
       if (!models.some(model => model.id === values.model)) throw new Error('model_unavailable')
-      console.log(JSON.stringify(await runInvestigations(run, new CopilotBackend(client, values.model, run, limits), values.workers ? Number(values.workers) : 2, limits, controller.signal), null, 2))
+      const outcome = await runInvestigations(run, new CopilotBackend(client, values.model, run, limits), values.workers ? Number(values.workers) : 2, limits, controller.signal)
+      console.log(JSON.stringify(outcome, null, 2))
+      if ((outcome.tasks as Array<{ state: string }>).some(task => task.state !== 'completed')) process.exitCode = 1
       await report(run)
     } finally { process.off('SIGINT', cancel); process.off('SIGTERM', cancel); await stopClient(client) }
     return

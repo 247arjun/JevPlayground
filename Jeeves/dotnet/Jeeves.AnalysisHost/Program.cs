@@ -4,6 +4,8 @@ using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.FlowAnalysis;
+using Microsoft.CodeAnalysis.Operations;
 
 namespace Jeeves.AnalysisHost;
 
@@ -71,6 +73,36 @@ internal static class Program
         {
             var start = request.GetProperty("start").GetInt32(); var end = request.GetProperty("end").GetInt32();
             return new { found = syntax.DescendantNodes().Any(node => node.SpanStart == start && node.Span.End == end) };
+        }
+        if (request.GetProperty("method").GetString() == "local")
+        {
+            var start = request.GetProperty("start").GetInt32(); var end = request.GetProperty("end").GetInt32();
+            var declaration = syntax.DescendantNodes().FirstOrDefault(node => node.SpanStart == start && node.Span.End == end && IsFunction(node));
+            var localCompilation = CSharpCompilation.Create("LocalEvidence", [tree], [MetadataReference.CreateFromFile(typeof(object).Assembly.Location)], new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+            var localModel = localCompilation.GetSemanticModel(tree);
+            ControlFlowGraph? graph = declaration == null ? null : localModel.GetOperation(declaration) switch
+            {
+                IMethodBodyOperation methodBody => ControlFlowGraph.Create(methodBody),
+                IConstructorBodyOperation constructorBody => ControlFlowGraph.Create(constructorBody),
+                _ => null
+            };
+            var blocks = graph?.Blocks.Take(100).Select(block => new
+            {
+                block.Ordinal, kind = block.Kind.ToString(), block.IsReachable,
+                operations = block.Operations.Take(50).Select(operation => new { kind = operation.Kind.ToString(), start = operation.Syntax.SpanStart, end = operation.Syntax.Span.End }).ToArray(),
+                branch = block.BranchValue == null ? null : new { start = block.BranchValue.Syntax.SpanStart, end = block.BranchValue.Syntax.Span.End },
+                fallThrough = block.FallThroughSuccessor?.Destination?.Ordinal,
+                conditional = block.ConditionalSuccessor?.Destination?.Ordinal
+            }).ToArray();
+            return new { blocks, capability = "semantic_partial", completion = "partial", reasons = new[] { "isolated_file_control_flow", "project_conditions_and_dependencies_not_loaded", "not_interprocedural_dataflow", "bounded_blocks_and_operations" } };
+        }
+        if (request.GetProperty("method").GetString() == "framework")
+        {
+            var usings = syntax.DescendantNodes().OfType<UsingDirectiveSyntax>().Select(item => item.Name?.ToString()).Where(item => item != null).ToArray();
+            var facts = syntax.DescendantNodes().OfType<AttributeSyntax>().Where(attribute =>
+                attribute.Name.ToString().Contains("Trigger", StringComparison.Ordinal) || attribute.Name.ToString() is "Function" or "FunctionName" or "Authorize" or "AllowAnonymous" or "HttpGet" or "HttpPost" or "Route")
+                .Take(100).Select(attribute => new { kind = "framework_attribute_candidate", name = attribute.Name.ToString(), start = attribute.SpanStart, end = attribute.Span.End }).ToArray();
+            return new { modelVersion = "dotnet-framework-v1", basis = "declared", usings, facts, completion = "partial", reasons = new[] { "attribute_identity_requires_project_resolution", "middleware_order_and_runtime_policy_unknown" } };
         }
         var calls = new List<object>(); var registrations = new List<object>();
         foreach (var node in syntax.DescendantNodes().Where(node => node is InvocationExpressionSyntax or ObjectCreationExpressionSyntax))

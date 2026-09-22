@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { defaultLimits } from '../domain.js'
+import { defaultLimits, type Limits } from '../domain.js'
 import { hash, readBounded } from '../security.js'
 import { Store } from '../storage/store.js'
 import { callPage } from './index.js'
@@ -10,8 +10,8 @@ import { CSharp } from './csharp.js'
 export class Navigation {
   readonly workspaces: Workspaces
   readonly csharp: CSharp
-  constructor (readonly store: Store) {
-    this.workspaces = new Workspaces(path.join(store.root, 'snapshot/source'))
+  constructor (readonly store: Store, limits: Limits = defaultLimits) {
+    this.workspaces = new Workspaces(path.join(store.root, 'snapshot/source'), limits)
     this.csharp = new CSharp(path.join(store.root, 'snapshot/source'))
   }
   async resolve (file: string, start: number, project: string): Promise<unknown> {
@@ -38,8 +38,7 @@ export class Navigation {
     const source = (await readBounded(path.join(this.store.root, 'snapshot/source'), file, defaultLimits.maxFileBytes)).toString()
     if (hash(source) !== row.hash) throw new Error('snapshot_hash_mismatch')
     if (/\.cs$/.test(file)) {
-      const parsed = await this.csharp.request('analyze', { file }) as { calls: Array<{ start: number, end: number }> }
-      return { operations: parsed.calls.filter(call => call.start >= start && call.end <= end).slice(0, 100), capability: 'syntax_only', completion: 'partial', reasons: ['guard_and_reaching_definition_analysis_not_available'] }
+      return await this.csharp.request('local', { file, start, end })
     }
     return localEvidence(file, source, start, end)
   }

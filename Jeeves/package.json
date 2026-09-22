@@ -7,12 +7,13 @@
   "bin": { "jeeves": "dist/src/cli.js" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "build:dotnet": "dotnet build dotnet/Jeeves.AnalysisHost/Jeeves.AnalysisHost.csproj -c Release",
+    "build:dotnet": "cd dotnet && dotnet build Jeeves.AnalysisHost/Jeeves.AnalysisHost.csproj -c Release",
     "test:all": "npm run build:dotnet && npm test",
     "test": "npm run build && node --test dist/tests/*.test.js",
     "check": "tsc --noEmit -p tsconfig.json",
     "start": "node dist/src/cli.js",
     "test:live": "npm run build && node dist/src/live-smoke.js",
+    "test:workflow-live": "npm run build && node dist/tests/live-workflow.js",
     "benchmark": "npm run build && node dist/src/benchmark.js"
   },
   "dependencies": {

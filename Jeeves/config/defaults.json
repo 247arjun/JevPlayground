@@ -1,0 +1,12 @@
+{
+  "maxFileBytes": 16777216,
+  "pageSize": 50,
+  "maxResultBytes": 98304,
+  "maxToolCalls": 40,
+  "maxModelCalls": 75,
+  "maxProviderRequests": 20,
+  "modelTimeoutMs": 120000,
+  "compilerTimeoutMs": 30000,
+  "compilerMemoryMb": 512,
+  "maxQueue": 16
+}
