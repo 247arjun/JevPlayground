@@ -37,9 +37,9 @@ node Jeeves/dist/src/cli.js status --run Jeeves/runs/review-001
 
 The importer accepts the version-1 dataset manifest used by the existing classifier: `dataset.json`, its checksummed `inventory.json`, rubric snapshot, function JSONL, and classification JSON array. Manifest filenames are used instead of hardcoding a target. It validates file sizes/hashes, source spans, sanitized hashes, answer labels/distributions and counts. Partial imports can be replayed idempotently; a different dataset requires a new run directory.
 
-Imports snapshot the classified source and selected project/configuration files. Environment files, installed dependencies, build output and escaping symlinks are not copied. Relevant configuration can contain literal secrets; review the source-disclosure policy before a live run. A snapshot makes the input stable but does not make it public or safe to transmit.
+Imports snapshot the classified source, additional TS/JS/C# source, selected project/configuration files, and README/security/contribution documents. Additional source is reported separately and is not treated as Jev-classified. Environment files, installed dependencies, build output and escaping symlinks are not copied. Relevant configuration can contain literal secrets; review the source-disclosure policy before a live run. A snapshot makes the input stable but does not make it public or safe to transmit. Imported sanitized implementations are independently checked against parser-based comment masking, rather than trusting their hashes alone.
 
-The index stores syntactic call and registration candidates. Semantic programs are loaded only when a tool explicitly requests a project context. A name-based reverse lookup is deliberately labeled incomplete: it does not prove all dynamic or aliased callers have been found.
+The index stores syntactic call and registration candidates, checkpointed by completed file. Interrupted generations replay only incomplete files. Semantic programs are loaded only when a tool explicitly requests a project context. A name-based reverse lookup is deliberately labeled incomplete. The additional `find_semantic_callers` tool follows compiler-resolved aliases within one selected TS/JS project and pages its progress; other projects, dynamic dispatch and external consumers remain explicit gaps. `trace_local_value` returns operand declarations, parameter boundaries, candidate writes and enclosing conditions, not a path-sensitive taint proof.
 
 Triage uses explicit operation/influence combinations and a reproducible control sample, not an aggregate vulnerability score. A maximum-25 plan currently selects at most one theme per function, reserves about 20% for controls, and keeps code-purpose labels. Localization deduplication across different parent/callback tasks is not yet implemented; inspect repeated operation spans in reports.
 
@@ -84,9 +84,9 @@ Reports are streamed to `reports/investigations.json`, `reports/summary.md`, and
 | Capability | Implemented Behavior |
 | --- | --- |
 | TS/JS syntax | Isolated parser worker, bounded file/result sizes, call and callback/registration candidates |
-| TS/JS semantics | Lazy real-project TypeScript programs; aliases/signatures to candidate source declarations; missing dependencies and dynamic dispatch remain partial |
+| TS/JS semantics | Lazy real-project TypeScript programs; aliases/signatures to candidate source declarations; paginated project-scoped reverse callers; local symbol/assignment evidence; missing dependencies and dynamic dispatch remain partial |
 | C# syntax | Roslyn calls, methods, comment trivia and exact syntax spans |
-| C# semantics | Bounded declarative project source loading with framework-core references; local candidate targets and isolated-file control-flow blocks |
+| C# semantics | Bounded declarative project source loading with framework-core references; local candidate targets, operand definitions and isolated-file control-flow blocks |
 | C# project limitations | No MSBuild evaluation, external package/reference resolution, multi-target build conditions, generators, or complete virtual/interface dispatch modeling |
 | Azure/Node evidence | Import-linked SDK invocations, Functions bindings and declared ARM JSON resources |
 | .NET framework evidence | Trigger/route/authorization attribute candidates with explicit identity/runtime limitations |

@@ -90,3 +90,51 @@ export function localEvidence (file: string, source: string, start: number, end:
   visit(parsed)
   return { definitions: definitions.slice(0, 100), guards: guards.slice(0, 100), operations: operations.slice(0, 100), capability: 'syntax_only', completion: 'partial', reasons: ['candidates_not_reaching_definition_proof', ...(definitions.length > 100 || guards.length > 100 || operations.length > 100 ? ['page_budget'] : [])] }
 }
+
+export function traceLocalValue (file: string, source: string, offset: number): Record<string, unknown> {
+  if (!Number.isInteger(offset) || offset < 0 || offset >= source.length) throw new Error('invalid_source_span')
+  const parsed = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
+  const options: ts.CompilerOptions = { noResolve: true, noLib: true, allowJs: true, noEmit: true }
+  const host = ts.createCompilerHost(options)
+  host.getSourceFile = name => name === file ? parsed : undefined
+  host.fileExists = name => name === file
+  host.readFile = name => name === file ? source : undefined
+  const checker = ts.createProgram([file], options, host).getTypeChecker()
+  let selected: ts.Node = parsed
+  const locate = (node: ts.Node) => {
+    if (node.getStart(parsed) <= offset && node.getEnd() > offset) { selected = node; ts.forEachChild(node, locate) }
+  }
+  locate(parsed)
+  const location = (node: ts.Node) => ({ file, start: node.getStart(parsed), end: node.getEnd(), kind: ts.SyntaxKind[node.kind] })
+  const symbol = checker.getSymbolAtLocation(selected)
+  const definitions: Array<Record<string, unknown>> = []
+  const writes: Array<Record<string, unknown>> = []
+  const guards: Array<Record<string, unknown>> = []
+  let owner = selected.parent
+  while (owner && !implementation(owner)) owner = owner.parent
+  for (const declaration of symbol?.getDeclarations() ?? []) {
+    if (definitions.length >= 30) break
+    if (ts.isVariableDeclaration(declaration)) definitions.push({ ...location(declaration), relationship: 'initializer_candidate', value: declaration.initializer ? location(declaration.initializer) : null })
+    else if (ts.isParameter(declaration)) {
+      const parameters = (declaration.parent as ts.SignatureDeclaration).parameters
+      definitions.push({ ...location(declaration), relationship: 'parameter_boundary', parameterIndex: parameters?.indexOf(declaration), value: declaration.initializer ? location(declaration.initializer) : null })
+    } else definitions.push({ ...location(declaration), relationship: 'declaration_boundary' })
+  }
+  const visit = (node: ts.Node) => {
+    if (implementation(node) && node !== owner) return
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment && symbol && checker.getSymbolAtLocation(node.left) === symbol && writes.length < 30) {
+      writes.push({ ...location(node), value: location(node.right), relationship: 'write_candidate_not_proven_reaching', occursBeforeUse: node.getStart(parsed) < offset })
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(owner ?? parsed)
+  let child: ts.Node = selected
+  while (child.parent && child.parent !== owner) {
+    const parent = child.parent
+    if (ts.isIfStatement(parent)) guards.push({ condition: location(parent.expression), branch: parent.thenStatement === child ? 'truthy_branch' : parent.elseStatement === child ? 'falsy_branch' : 'condition', relationship: 'enclosing_branch_not_sanitizer_proof' })
+    if (ts.isConditionalExpression(parent)) guards.push({ condition: location(parent.condition), branch: parent.whenTrue === child ? 'truthy_branch' : 'other', relationship: 'enclosing_conditional' })
+    child = parent
+  }
+  return { expression: location(selected), definitions, writes, guards: guards.slice(0, 30), capability: 'semantic_partial', completion: 'partial',
+    reasons: ['local_file_symbol_binding_only', 'aliasing_and_path_feasibility_not_proven', ...(definitions.length >= 30 || writes.length >= 30 || guards.length > 30 ? ['page_budget'] : [])] }
+}

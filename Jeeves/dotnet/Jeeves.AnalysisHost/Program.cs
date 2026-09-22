@@ -62,6 +62,25 @@ internal static class Program
         var syntax = tree.GetRoot();
         if (request.GetProperty("method").GetString() == "comments")
             return new { ranges = syntax.DescendantTrivia(descendIntoTrivia: false).Where(trivia => trivia.IsKind(SyntaxKind.SingleLineCommentTrivia) || trivia.IsKind(SyntaxKind.MultiLineCommentTrivia) || trivia.IsKind(SyntaxKind.SingleLineDocumentationCommentTrivia) || trivia.IsKind(SyntaxKind.MultiLineDocumentationCommentTrivia)).Select(trivia => new { start = trivia.FullSpan.Start, end = trivia.FullSpan.End }).ToArray() };
+        if (request.GetProperty("method").GetString() == "trace")
+        {
+            var offset = request.GetProperty("start").GetInt32();
+            if (offset < 0 || offset >= source.Length) throw new InvalidOperationException("invalid_source_span");
+            var selected = syntax.FindToken(offset).Parent!;
+            var localCompilation = CSharpCompilation.Create("LocalTrace", [tree], [MetadataReference.CreateFromFile(typeof(object).Assembly.Location)], new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+            var localModel = localCompilation.GetSemanticModel(tree);
+            var symbol = localModel.GetSymbolInfo(selected).Symbol;
+            var definitions = symbol?.DeclaringSyntaxReferences.Take(30).Select(reference =>
+            {
+                var declaration = reference.GetSyntax();
+                return new { file = relative, start = declaration.SpanStart, end = declaration.Span.End, kind = declaration.Kind().ToString(), relationship = declaration is ParameterSyntax ? "parameter_boundary" : "declaration_candidate" };
+            }).ToArray();
+            var owner = selected.Ancestors().FirstOrDefault(IsFunction) ?? syntax;
+            var writes = owner.DescendantNodes().OfType<AssignmentExpressionSyntax>().Where(assignment => symbol != null && SymbolEqualityComparer.Default.Equals(localModel.GetSymbolInfo(assignment.Left).Symbol, symbol)).Take(30)
+                .Select(assignment => new { file = relative, start = assignment.SpanStart, end = assignment.Span.End, valueStart = assignment.Right.SpanStart, valueEnd = assignment.Right.Span.End, relationship = "write_candidate_not_proven_reaching" }).ToArray();
+            var guards = selected.Ancestors().OfType<IfStatementSyntax>().Take(30).Select(statement => new { file = relative, start = statement.Condition.SpanStart, end = statement.Condition.Span.End, relationship = "enclosing_condition_not_sanitizer_proof" }).ToArray();
+            return new { expression = new { file = relative, start = selected.SpanStart, end = selected.Span.End }, definitions, writes, guards, capability = "semantic_partial", completion = "partial", reasons = new[] { "isolated_file_symbol_binding", "reaching_writes_and_project_conditions_not_proven" } };
+        }
         if (request.GetProperty("method").GetString() == "read")
         {
             var start = request.GetProperty("start").GetInt32();

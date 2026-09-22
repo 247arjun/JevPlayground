@@ -1,4 +1,4 @@
-import { defaultLimits, type FunctionRecord, type Limits } from '../domain.js'
+import { defaultLimits, classificationSchema, type FunctionRecord, type Limits } from '../domain.js'
 import { errorCode } from '../security.js'
 import { Store, getArtifact, putArtifact } from '../storage/store.js'
 import { withRunLock } from '../storage/lock.js'
@@ -28,7 +28,10 @@ export async function runInvestigations (run: string, backend: AgentBackend, wor
           try {
             const row = (await store.query('SELECT * FROM functions WHERE id=?', [String(task.function_id)]))[0]!
             const fn = await getArtifact<FunctionRecord>(run, String(row.artifact))
-            const classification = row.classification_artifact ? await getArtifact(run, String(row.classification_artifact)) : null
+            const rawClassification = row.classification_artifact ? classificationSchema.parse(await getArtifact(run, String(row.classification_artifact))) : null
+            // Preserve raw imports for audit, but send only normalized answers.
+            // Extra imported fields must not bypass the sanitized-source tools.
+            const classification = rawClassification ? { model: rawClassification.model, answers: rawClassification.answers } : null
             const prior = task.result ? await getArtifact(run, String(task.result)) : null
             const context = { task: { id: task.id, attempt: task.attempt, role: task.role, theme: task.theme, codePurpose: task.purpose }, function: { id: fn.id, file: fn.file, start: fn.start, end: fn.end, name: fn.name }, classification, prior, instructions: 'Use read_source for cited code; do not assume classification labels establish related flows.' }
             const requestHash = await putArtifact(run, context)

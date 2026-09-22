@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { syntaxIndex } from '../src/analysis/syntax.js'
+import { syntaxIndex, traceLocalValue } from '../src/analysis/syntax.js'
 import { callPage } from '../src/analysis/index.js'
 import { Workspaces } from '../src/analysis/workspaces.js'
 import { Store } from '../src/storage/store.js'
@@ -15,6 +15,18 @@ test('syntax calls preserve nesting and registration is not invocation', () => {
   assert.ok(fetchCall.callerId)
   assert.equal(fetchCall.data.resolution, 'unresolved')
   assert.equal(result.registrations[0]?.kind, 'azure_functions_registration_candidate')
+})
+
+test('local tracing connects identifiers to declarations without treating guards as safety', () => {
+  const source = 'function use(input: string) { let value = input; if (input.length) { value = input.trim(); return consume(value) } }'
+  const result = traceLocalValue('code.ts', source, source.indexOf('consume(value)') + 8)
+  const definitions = result.definitions as Array<{ relationship: string }>
+  assert.equal(definitions[0]?.relationship, 'initializer_candidate')
+  assert.equal((result.writes as unknown[]).length, 1)
+  assert.equal((result.guards as unknown[]).length, 1)
+  assert.ok((result.reasons as string[]).includes('aliasing_and_path_feasibility_not_proven'))
+  const parameter = traceLocalValue('code.ts', source, source.indexOf('= input') + 2)
+  assert.equal((parameter.definitions as Array<{ relationship: string }>)[0]?.relationship, 'parameter_boundary')
 })
 
 test('call lookup uses bounded stable pages and rejects mismatched generations', async () => {
@@ -53,5 +65,10 @@ test('shared semantic worker resolves imported aliases with one cold load', asyn
     assert.equal(pool.metrics.loads, 1)
     assert.equal(pool.metrics.coalesced, 4)
     assert.equal(pool.metrics.maxResident, 1)
+    const expectedTarget = (results[0] as { targets: Array<{ id: string }> }).targets[0]!.id
+    const callers = await pool.callers('tsconfig.json', expectedTarget, undefined, 1) as { rows: Array<{ file: string }>, reasons: string[] }
+    assert.equal(callers.rows[0]?.file, 'code.ts')
+    assert.ok(callers.reasons.includes('unsearched_projects_and_external_consumers'))
+    assert.equal(pool.metrics.loads, 1)
   } finally { pool.close(); await rm(root, { recursive: true, force: true }) }
 })

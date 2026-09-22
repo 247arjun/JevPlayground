@@ -16,8 +16,14 @@ export class Workspaces {
   constructor (private readonly root: string, private readonly limits: Limits = defaultLimits) {}
 
   async resolve (project: string, file: string, start: number): Promise<unknown> {
+    return await this.request(project, 'resolve', { file, start })
+  }
+  async callers (project: string, targetId: string, cursor: unknown, limit: number): Promise<unknown> {
+    return await this.request(project, 'callers', { targetId, cursor, limit })
+  }
+  private async request (project: string, method: string, fields: Record<string, unknown>): Promise<unknown> {
     if (this.closed) throw new Error('workspace_pool_closed')
-    const key = JSON.stringify([project, file, start])
+    const key = JSON.stringify([project, method, fields])
     const existing = this.inflight.get(key)
     if (existing) { this.metrics.coalesced++; return await existing }
     if (this.queue.length >= this.limits.maxQueue) throw new Error('compiler_backpressure')
@@ -34,7 +40,7 @@ export class Workspaces {
           await this.rpc('load', { project })
           this.metrics.loads++; this.metrics.maxResident = 1
         } else this.metrics.cacheHits++
-        const result = await this.rpc('resolve', { file, start })
+        const result = await this.rpc(method, fields)
         this.idle = setTimeout(() => this.evict(), 30000).unref()
         return result
       } })

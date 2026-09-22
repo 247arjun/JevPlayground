@@ -16,15 +16,26 @@ export async function buildIndex (run: string): Promise<Record<string, unknown>>
     try {
       if (!await store.get('importComplete')) throw new Error('import_not_complete')
       const snapshotId = await store.get<string>('snapshotId')
-      const generation = hash(JSON.stringify([snapshotId, 'syntax-v3', ts.version, 'roslyn-4.11.0']))
-      if (await store.get('indexGeneration') === generation) return { status: 'already_indexed', generation }
+      const generation = hash(JSON.stringify([snapshotId, 'syntax-v4', ts.version, 'roslyn-4.11.0']))
+      const previousStats = await store.get<{ incompleteFiles?: number }>('indexStats')
+      if (await store.get('indexGeneration') === generation && !previousStats?.incompleteFiles) return { status: 'already_indexed', generation }
       await store.set('indexGeneration', null)
-      await store.batch(['calls', 'registrations', 'projects', 'semantic_results', 'coverage'].map(table => ({ sql: `DELETE FROM ${table}` })))
-      let files = 0; let callCount = 0
+      if (await store.get('indexBuilding') !== generation) {
+        await store.batch(['calls', 'registrations', 'projects', 'semantic_results', 'coverage', 'index_batches'].map(table => ({ sql: `DELETE FROM ${table}` })))
+        await store.set('indexBuilding', generation)
+      }
+      let reusedFiles = 0
       for await (const file of store.scan('files')) {
         const relative = String(file.path)
+        const done = (await store.query('SELECT hash FROM index_batches WHERE generation=? AND file=?', [generation, relative]))[0]
+        if (done?.hash === file.hash) { reusedFiles++; continue }
         const bytes = await readBounded(path.join(run, 'snapshot/source'), relative, defaultLimits.maxFileBytes)
         if (hash(bytes) !== file.hash) throw new Error('snapshot_hash_mismatch')
+        await store.batch([
+          { sql: 'DELETE FROM calls WHERE file=?', params: [relative] },
+          { sql: 'DELETE FROM registrations WHERE file=?', params: [relative] },
+          { sql: 'DELETE FROM projects WHERE file=?', params: [relative] }
+        ])
         if (/(^|\/)tsconfig[^/]*\.json$/.test(relative)) {
           const parsed = ts.parseConfigFileTextToJson(relative, bytes.toString())
           await store.execute('INSERT INTO projects VALUES (?,?,?,?,?,?)', [relative, relative, 'tsjs', hash(JSON.stringify([snapshotId, file.hash, ts.version])), 'syntax_only', JSON.stringify(parsed.error ? ['configuration_parse_error'] : [])])
@@ -42,6 +53,7 @@ export async function buildIndex (run: string): Promise<Record<string, unknown>>
             continue
           }
         } else {
+          await store.execute('INSERT OR REPLACE INTO index_batches VALUES (?,?,?)', [generation, relative, String(file.hash)])
           continue
         }
         let operations: Operation[] = []
@@ -57,11 +69,15 @@ export async function buildIndex (run: string): Promise<Record<string, unknown>>
         }
         await flush()
         await store.execute('INSERT OR REPLACE INTO coverage VALUES (?,?,?)', [relative, 'syntax_only', JSON.stringify(result.diagnostics.length ? ['parse_error'] : ['semantic_resolution_deferred'])])
-        files++; callCount += result.calls.length
+        await store.execute('INSERT OR REPLACE INTO index_batches VALUES (?,?,?)', [generation, relative, String(file.hash)])
       }
+      const files = Number((await store.query("SELECT COUNT(*) AS count FROM coverage WHERE capability!='unavailable'"))[0]!.count)
+      const callCount = Number((await store.query('SELECT COUNT(*) AS count FROM calls'))[0]!.count)
+      const incompleteFiles = Number((await store.query('SELECT COUNT(*) AS count FROM files WHERE NOT EXISTS (SELECT 1 FROM index_batches WHERE index_batches.generation=? AND index_batches.file=files.path)', [generation]))[0]!.count)
       await store.set('indexGeneration', generation)
-      await store.set('indexStats', { files, calls: callCount, generation })
-      return { status: 'indexed', files, calls: callCount, generation }
+      await store.set('indexStats', { files, calls: callCount, generation, reusedFiles, incompleteFiles })
+      if (!incompleteFiles) await store.set('indexBuilding', null)
+      return { status: incompleteFiles ? 'partial' : 'indexed', files, calls: callCount, generation, reusedFiles, incompleteFiles }
     } finally { syntax.close(); csharp.close(); await store.close() }
   })
 }

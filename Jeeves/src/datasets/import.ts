@@ -7,6 +7,8 @@ import { atomicJson, canonicalOutput, containedFile, hash, readBounded, relative
 import { Store, putArtifact, type Operation } from '../storage/store.js'
 import { withRunLock } from '../storage/lock.js'
 import { fileHash, jsonArray, jsonLines } from './stream.js'
+import { maskComments } from '../analysis/syntax.js'
+import { CSharp } from '../analysis/csharp.js'
 
 const manifestSchema = z.object({
   schemaVersion: z.literal(1), repository: z.string(), revision: z.string(), model: z.string(),
@@ -18,12 +20,12 @@ const inventoryFileSchema = z.object({ file: z.string(), sourceHash: digestSchem
 const excluded = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.angular', '.cache', 'bin', 'obj'])
 const configPattern = /^(?:tsconfig[^/]*\.json|package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|host\.json|function\.json|global\.json|appsettings(?:\.[^/]+)?\.json|azuredeploy(?:\.[^/]+)?\.json|Directory\.[^.]+\.(?:props|targets)|[^/]+\.(?:csproj|sln|slnx|bicep|tf))$/i
 
-async function * configurationFiles (root: string, relative = ''): AsyncGenerator<string> {
+async function * snapshotFiles (root: string, relative = ''): AsyncGenerator<string> {
   for (const entry of await readdir(path.join(root, relative), { withFileTypes: true })) {
     if (entry.isSymbolicLink()) continue
     const file = relative ? `${relative}/${entry.name}` : entry.name
-    if (entry.isDirectory() && !excluded.has(entry.name)) yield * configurationFiles(root, file)
-    else if (entry.isFile() && configPattern.test(entry.name)) yield file
+    if (entry.isDirectory() && !excluded.has(entry.name)) yield * snapshotFiles(root, file)
+    else if (entry.isFile() && (configPattern.test(entry.name) || /\.(?:[cm]?[jt]sx?|cs)$/i.test(entry.name) || /^(?:README|SECURITY|CONTRIBUTING)\.md$/i.test(entry.name))) yield file
   }
 }
 
@@ -52,6 +54,7 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
     if (hash(JSON.stringify(questions)) !== manifest.questionsHash || Object.keys(questions).length !== manifest.questionCount) throw new Error('rubric_mismatch')
     const datasetId = hash(JSON.stringify(manifest))
     const store = await Store.open(run)
+    const csharp = new CSharp(path.join(run, 'snapshot/source'))
     try {
       const previous = await store.get<string>('datasetId')
       if (previous && previous !== datasetId) throw new Error('different_dataset')
@@ -59,6 +62,7 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
         for await (const file of store.scan('files')) {
           if (await fileHash(source, String(file.path)) !== file.hash) throw new Error('source_hash_mismatch')
         }
+        for await (const file of snapshotFiles(source)) if (!(await store.query('SELECT path FROM files WHERE path=?', [file])).length) throw new Error('source_inventory_changed')
         return { status: 'already_imported', ...(await store.get<Record<string, unknown>>('manifest')) }
       }
       await store.set('datasetId', datasetId)
@@ -80,26 +84,43 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
           exists = false
         }
         if (!exists) { await writeFile(target, bytes, { mode: 0o400, flag: 'wx' }); await chmod(target, 0o400) }
-        const language = /\.[cm]?[jt]sx?$/i.test(file) ? 'tsjs' : /\.cs$/i.test(file) ? 'csharp' : 'configuration'
+        const language = /\.[cm]?[jt]sx?$/i.test(file) ? 'tsjs' : /\.cs$/i.test(file) ? 'csharp' : /\.md$/i.test(file) ? 'documentation' : 'configuration'
         await store.execute('INSERT INTO files VALUES (?,?,?,?) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash,bytes=excluded.bytes', [file, digest, bytes.length, language])
       }
       for await (const raw of jsonArray(dataset, 'inventory.json', 'files')) {
         const file = inventoryFileSchema.parse(raw)
         await capture(file.file, file.sourceHash)
       }
-      for await (const file of configurationFiles(source)) await capture(file)
+      let additionalSourceFiles = 0
+      for await (const file of snapshotFiles(source)) {
+        if ((await store.query('SELECT path FROM files WHERE path=?', [file])).length) continue
+        await capture(file)
+        if (/\.(?:[cm]?[jt]sx?|cs)$/i.test(file)) additionalSourceFiles++
+      }
       let functionCount = 0
       let lastFile = ''
       let sourceText = ''
+      let sanitizedText = ''
       for await (const raw of jsonLines(dataset, manifest.sourceFile)) {
         const record = functionSchema.parse(raw)
         if (record.file !== lastFile) {
           sourceText = (await readBounded(snapshotRoot, record.file, defaultLimits.maxFileBytes)).toString()
+          if (/\.cs$/i.test(record.file)) {
+            const comments = await csharp.request('comments', { file: record.file }) as { ranges: Array<{ start: number, end: number }> }
+            const pieces: string[] = []; let position = 0
+            for (const range of comments.ranges) {
+              pieces.push(sourceText.slice(position, range.start), sourceText.slice(range.start, range.end).replace(/[^\r\n\u2028\u2029]/g, ' '))
+              position = range.end
+            }
+            pieces.push(sourceText.slice(position)); sanitizedText = pieces.join('')
+          } else if (/\.[cm]?[jt]sx?$/i.test(record.file)) sanitizedText = maskComments(record.file, sourceText)
+          else throw new Error('unsupported_function_language')
           lastFile = record.file
         }
         if (record.start.offset >= record.end.offset || sourceText.slice(record.start.offset, record.end.offset) !== record.function ||
             hash(record.function) !== record.sourceHash || hash(record.sanitizedFunction) !== record.sanitizedSourceHash ||
             record.function.length !== record.sanitizedFunction.length) throw new Error('function_source_mismatch')
+          if (sanitizedText.slice(record.start.offset, record.end.offset) !== record.sanitizedFunction) throw new Error('sanitized_implementation_mismatch')
         const artifact = await putArtifact(run, record)
         await store.execute('INSERT INTO functions VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?)', [record.id, record.file, record.name, record.kind, record.start.offset, record.end.offset, record.parentId, record.sourceHash, record.sanitizedSourceHash, artifact, purpose(record.file)])
         functionCount++
@@ -121,7 +142,7 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
       const fingerprint = createHash('sha256').update(datasetId)
       for await (const file of store.scan('files')) fingerprint.update(JSON.stringify([file.path, file.hash]) + '\n')
       const snapshotId = fingerprint.digest('hex')
-      const saved = { schemaVersion: 1, datasetId, snapshotId, repository: manifest.repository, revision: manifest.revision, model: manifest.model, questionsHash: manifest.questionsHash, functionCount, classificationCount, importedAt: new Date().toISOString(), sourceRoot: source }
+      const saved = { schemaVersion: 1, datasetId, snapshotId, repository: manifest.repository, revision: manifest.revision, model: manifest.model, questionsHash: manifest.questionsHash, functionCount, classificationCount, additionalSourceFiles, importedAt: new Date().toISOString(), sourceRoot: source }
       await atomicJson(path.join(run, 'inputs/dataset.json'), manifest)
       await atomicJson(path.join(run, 'inputs/questions.snapshot.json'), questions)
       await atomicJson(path.join(run, 'manifest.json'), saved)
@@ -129,6 +150,6 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
       await store.set('snapshotId', snapshotId)
       await store.set('importComplete', true)
       return { status: 'imported', ...saved }
-    } finally { await store.close() }
+    } finally { csharp.close(); await store.close() }
   })
 }

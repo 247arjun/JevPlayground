@@ -19,9 +19,26 @@ test('role workflow persists verified evidence and reports without live models',
   try {
     const paths = await fixture(root); await importDataset(paths.dataset, paths.source, paths.run); await buildIndex(paths.run)
     const store = await Store.open(paths.run)
-    try { await planTasks(store, 1) } finally { await store.close() }
+    try {
+      const generation = await store.get('indexGeneration')
+      await store.set('indexGeneration', null)
+      await store.set('indexBuilding', generation)
+    } finally { await store.close() }
+    const recovered = await buildIndex(paths.run)
+    assert.equal(recovered.status, 'indexed')
+    assert.ok(Number(recovered.reusedFiles) >= 2)
+    const planningStore = await Store.open(paths.run)
+    try {
+      const stats = await planningStore.get<Record<string, unknown>>('indexStats')
+      await planningStore.set('indexStats', { ...stats, incompleteFiles: 1 })
+    } finally { await planningStore.close() }
+    const retried = await buildIndex(paths.run)
+    assert.equal(retried.status, 'indexed')
+    const readyStore = await Store.open(paths.run)
+    try { await planTasks(readyStore, 1) } finally { await readyStore.close() }
     const roles: string[] = []
-    await runInvestigations(paths.run, { execute: async (task, _context, gateway) => {
+    await runInvestigations(paths.run, { execute: async (task, context, gateway) => {
+      assert.deepEqual(Object.keys((context as { classification: Record<string, unknown> }).classification), ['model', 'answers'])
       roles.push(String(task.role))
       const source = await readFile(path.join(paths.source, 'code.ts'), 'utf8')
       const evidence = await gateway.read('code.ts', 0, source.length)

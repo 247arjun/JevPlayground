@@ -29,6 +29,7 @@ database.exec(`
   CREATE TABLE IF NOT EXISTS registrations (id TEXT PRIMARY KEY, file TEXT NOT NULL, start INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS semantic_results (key TEXT PRIMARY KEY, project_id TEXT NOT NULL, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS coverage (scope TEXT PRIMARY KEY, capability TEXT NOT NULL, reasons TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS index_batches (generation TEXT NOT NULL, file TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(generation,file));
   CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, function_id TEXT NOT NULL REFERENCES functions(id), theme TEXT NOT NULL,
     purpose TEXT NOT NULL, state TEXT NOT NULL, role TEXT NOT NULL, attempt TEXT, deadline INTEGER, result TEXT, error TEXT, priority INTEGER NOT NULL);
   CREATE INDEX IF NOT EXISTS tasks_queue ON tasks(state,priority,id);
