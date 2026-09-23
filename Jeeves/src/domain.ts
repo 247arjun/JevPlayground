@@ -50,7 +50,9 @@ export const resultSchema = z.object({
   facts: z.array(z.object({ text: z.string().max(4000), citations: z.array(citationSchema).min(1).max(10) }).strict()).max(30),
   assumptions: z.array(z.string().max(2000)).max(20),
   counterevidence: z.array(z.object({ text: z.string().max(4000), citations: z.array(citationSchema).min(1).max(10) }).strict()).max(20),
-  unresolved: z.array(z.string().max(2000)).max(20)
+  unresolved: z.array(z.string().max(2000)).max(20),
+  flow: z.array(z.object({ from: citationSchema, to: citationSchema, boundary: z.enum(['local', 'call', 'persistence', 'template', 'configuration', 'external']), relationship: z.string().min(1).max(2000), status: z.enum(['candidate', 'supported']) }).strict()).max(20).optional(),
+  followUps: z.array(z.object({ subjectId: z.string().min(1).max(2048), theme: z.string().regex(/^[a-z-]+$/).max(100), operation: citationSchema, rationale: z.string().min(1).max(2000) }).strict()).max(5).optional()
 }).strict()
 export type AgentResult = z.infer<typeof resultSchema>
 export type Role = 'localizer' | 'investigator' | 'challenger'
@@ -61,7 +63,9 @@ export const limitsSchema = z.object({
   pageSize: z.number().int().min(1).max(200).default(50),
   maxResultBytes: z.number().int().min(1024).max(1024 * 1024).default(96 * 1024),
   maxToolCalls: z.number().int().min(1).max(100).default(40),
-  maxModelCalls: z.number().int().min(1).max(1000).default(75),
+  maxModelCalls: z.number().int().positive().nullable().default(null),
+  maxRunDurationMs: z.number().int().positive().nullable().default(null),
+  maxRunProviderRequests: z.number().int().positive().nullable().default(null),
   maxProviderRequests: z.number().int().min(1).max(100).default(20),
   maxAiCreditsPerSession: z.number().positive().optional(),
   modelTimeoutMs: z.number().int().min(1000).max(600000).default(120000),

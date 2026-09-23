@@ -14,8 +14,8 @@ export class Store {
   private worker: Worker
   private ready: Promise<void>
   private dead = false
-  constructor (readonly root: string) {
-    this.worker = new Worker(new URL('./worker.js', import.meta.url), { execArgv: [], workerData: { file: path.join(root, 'state.sqlite') } })
+  constructor (readonly root: string, readOnly = false) {
+    this.worker = new Worker(new URL('./worker.js', import.meta.url), { execArgv: [], workerData: { file: path.join(root, 'state.sqlite'), readOnly } })
     this.ready = new Promise((resolve, reject) => {
       this.worker.once('error', reject)
       this.worker.on('message', message => {
@@ -36,17 +36,17 @@ export class Store {
     this.worker.on('error', fail)
     this.worker.on('exit', fail)
   }
-  static async open (root: string): Promise<Store> {
-    await mkdir(root, { recursive: true, mode: 0o700 })
+  static async open (root: string, readOnly = false): Promise<Store> {
+    if (!readOnly) await mkdir(root, { recursive: true, mode: 0o700 })
     if ((await lstat(root)).isSymbolicLink()) throw new Error('symlink_not_allowed')
     for (const name of ['state.sqlite', 'state.sqlite-wal', 'state.sqlite-shm']) {
       try { if ((await lstat(path.join(root, name))).isSymbolicLink()) throw new Error('symlink_not_allowed') } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
     }
-    const store = new Store(root)
+    const store = new Store(root, readOnly)
     await store.ready
-    await chmod(path.join(root, 'state.sqlite'), 0o600)
+    if (!readOnly) await chmod(path.join(root, 'state.sqlite'), 0o600)
     return store
   }
   private async send (kind: string, operations: Operation[] = []): Promise<unknown[]> {
@@ -75,7 +75,7 @@ export class Store {
     const row = (await this.query('SELECT value FROM meta WHERE key=?', [key]))[0]
     return row ? JSON.parse(String(row.value)) as T : undefined
   }
-  async * scan (table: 'files' | 'functions' | 'tasks' | 'projects' | 'calls'): AsyncGenerator<Row> {
+  async * scan (table: 'files' | 'functions' | 'tasks' | 'projects' | 'calls' | 'review_subjects' | 'candidates' | 'followups'): AsyncGenerator<Row> {
     const key = table === 'files' ? 'path' : 'id'
     let after = ''
     while (true) {

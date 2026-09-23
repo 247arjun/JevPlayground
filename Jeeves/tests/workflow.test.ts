@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -57,6 +57,10 @@ test('role workflow persists verified evidence and reports without live models',
     const results = JSON.parse(await readFile(path.join(paths.run, 'reports/investigations.json'), 'utf8'))
     assert.equal(results[0].result.disposition, 'refuted_hypothesis')
     assert.equal(results[0].state, 'completed')
+    const coverage = JSON.parse(await readFile(path.join(paths.run, 'reports/coverage.json'), 'utf8'))
+    assert.equal(coverage.execution.queueDrained, true)
+    assert.ok(coverage.catalogue.some((row: { decision: string }) => row.decision === 'deferred'))
+    assert.ok((await readFile(path.join(paths.run, 'reports/candidates.jsonl'), 'utf8')).includes('classification_signals'))
     await runInvestigations(paths.run, { execute: async () => { assert.fail('Completed tasks must not rerun') } })
   } finally { await rm(root, { recursive: true, force: true }) }
 })
@@ -164,4 +168,85 @@ test('source withheld by the byte limit is not valid citation evidence', async (
       assert.equal((await invokeTool(gateway, 'submit_result', result)).accepted, true)
     } finally { navigation.close(); await store.close() }
   } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('non-function subjects use parsed citation anchors and remain unclassified', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-template-review-'))
+  try {
+    const paths = await fixture(root)
+    const text = '<p>{{ message }}</p>'
+    await writeFile(path.join(paths.source, 'view.html'), text)
+    await importDataset(paths.dataset, paths.source, paths.run); await buildIndex(paths.run)
+    const store = await Store.open(paths.run)
+    try { await planTasks(store) } finally { await store.close() }
+    let sawTemplate = false
+    await runInvestigations(paths.run, { execute: async (task, context, gateway) => {
+      const input = context as { subject: { file: string, start: number, end: number }, classification: unknown, function: unknown }
+      if (input.subject.file === 'view.html') {
+        sawTemplate = true; assert.equal(input.classification, null); assert.equal(input.function, null)
+        const evidence = await gateway.read('view.html', 0, text.length)
+        const citation = { file: 'view.html', start: 0, end: text.length, sourceHash: String(evidence.sourceHash) }
+        await assert.rejects(gateway.accept({ disposition: 'needs_context', summary: 'Invalid fragment.', operation: { ...citation, end: 3 }, invariant: '', facts: [], assumptions: [], counterevidence: [], unresolved: [] }), /operation_not_parsed_anchor/)
+        await gateway.accept({ disposition: 'refuted_hypothesis', summary: 'The selected template displays a text interpolation.', operation: citation, invariant: 'Treat user text as text.', facts: [{ text: 'Plain interpolation is shown.', citations: [citation] }], assumptions: [], counterevidence: [], unresolved: [] })
+      } else await gateway.accept({ disposition: 'no_relevant_operation', summary: 'No operation selected by the offline fixture.', operation: null, invariant: '', facts: [], assumptions: [], counterevidence: [], unresolved: [] })
+    } })
+    assert.equal(sawTemplate, true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('overall session and provider budgets pause queued work across resumes', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-run-budget-'))
+  try {
+    const paths = await fixture(root)
+    await importDataset(paths.dataset, paths.source, paths.run); await buildIndex(paths.run)
+    const store = await Store.open(paths.run)
+    try { await planTasks(store) } finally { await store.close() }
+    let calls = 0
+    const backend = { execute: async (_task: unknown, _context: unknown, gateway: Gateway) => {
+      calls++
+      await gateway.accept({ disposition: 'no_relevant_operation', summary: 'Offline fixture result.', operation: null, invariant: '', facts: [], assumptions: [], counterevidence: [], unresolved: [] })
+    } }
+    const outcome = await runInvestigations(paths.run, backend, 1, { ...defaultLimits, maxModelCalls: 1 })
+    assert.equal(outcome.blockReason, 'run_session_budget_exhausted')
+    await runInvestigations(paths.run, backend, 1, { ...defaultLimits, maxModelCalls: 1 })
+    assert.equal(calls, 1)
+    const paused = await runInvestigations(paths.run, { execute: async (_task, _context, gateway, signal) => {
+      gateway.recordUsage({ id: 'event-one', model: 'fake', inputTokens: 1, outputTokens: 1 })
+      assert.equal(signal.aborted, true)
+      throw new Error('cancelled')
+    } }, 1, { ...defaultLimits, maxRunProviderRequests: 1 })
+    assert.equal(paused.blockReason, 'run_provider_budget_exhausted')
+    const saved = await Store.open(paths.run)
+    try {
+      assert.equal((await saved.query('SELECT COUNT(*) AS count FROM provider_usage'))[0]?.count, 1)
+      assert.ok((await saved.query("SELECT id FROM tasks WHERE state='queued'")).length)
+      assert.equal((await saved.query("SELECT id FROM tasks WHERE state='failed'")).length, 0)
+    } finally { await saved.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('crash recovery charges only time since the last atomic clock checkpoint', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: 10000 })
+  const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-clock-'))
+  try {
+    const paths = await fixture(root)
+    await importDataset(paths.dataset, paths.source, paths.run); await buildIndex(paths.run)
+    const store = await Store.open(paths.run)
+    try {
+      await planTasks(store)
+      await store.set('runElapsedMs', 5000)
+      await store.set('activeSegmentStarted', 9000)
+    } finally { await store.close() }
+    await runInvestigations(paths.run, { execute: async () => { assert.fail('Exhausted time must not start a model call') } }, 1, { ...defaultLimits, maxRunDurationMs: 6000 })
+    const recovered = await Store.open(paths.run)
+    try {
+      assert.equal(await recovered.get('runElapsedMs'), 6000)
+      assert.equal(await recovered.get('activeSegmentStarted'), null)
+      assert.equal(await recovered.get('blockReason'), 'run_time_budget_exhausted')
+      assert.equal((await recovered.query('SELECT COUNT(*) AS count FROM attempts'))[0]?.count, 0)
+    } finally { await recovered.close() }
+    await runInvestigations(paths.run, { execute: async () => { assert.fail('Resuming must not reset time') } }, 1, { ...defaultLimits, maxRunDurationMs: 6000 })
+    const repeated = await Store.open(paths.run)
+    try { assert.equal(await repeated.get('runElapsedMs'), 6000) } finally { await repeated.close() }
+  } finally { context.mock.timers.reset(); await rm(root, { recursive: true, force: true }) }
 })

@@ -9,6 +9,7 @@ import { withRunLock } from '../storage/lock.js'
 import { fileHash, jsonArray, jsonLines } from './stream.js'
 import { maskComments } from '../analysis/syntax.js'
 import { CSharp } from '../analysis/csharp.js'
+import { pathPurpose, recordPurposes } from '../analysis/purpose.js'
 
 const manifestSchema = z.object({
   schemaVersion: z.literal(1), repository: z.string(), revision: z.string(), model: z.string(),
@@ -18,21 +19,29 @@ const manifestSchema = z.object({
 }).passthrough()
 const inventoryFileSchema = z.object({ file: z.string(), sourceHash: digestSchema }).passthrough()
 const excluded = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.angular', '.cache', 'bin', 'obj'])
+const snapshotPolicy = 'source-and-context-v2'
+const privateFile = /(^|\/)(?:\.env(?:\..*)?|credentials(?:\.[^/]*)?|secrets?(?:\.[^/]*)?|[^/]+\.(?:pem|key|p12|pfx|kdbx|keystore))$/i
+const templatePattern = /\.(?:html?|ejs|hbs|handlebars|pug|cshtml|razor|vue|svelte)$/i
+const contextPattern = /\.(?:jsonc?|ya?ml|toml|ini|cfg|conf|properties|xml)$/i
 const configPattern = /^(?:tsconfig[^/]*\.json|package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|host\.json|function\.json|global\.json|appsettings(?:\.[^/]+)?\.json|azuredeploy(?:\.[^/]+)?\.json|Directory\.[^.]+\.(?:props|targets)|[^/]+\.(?:csproj|sln|slnx|bicep|tf))$/i
 
-async function * snapshotFiles (root: string, relative = ''): AsyncGenerator<string> {
+async function * snapshotFiles (root: string, relative = '', store?: Store): AsyncGenerator<string> {
   for (const entry of await readdir(path.join(root, relative), { withFileTypes: true })) {
-    if (entry.isSymbolicLink()) continue
     const file = relative ? `${relative}/${entry.name}` : entry.name
-    if (entry.isDirectory() && !excluded.has(entry.name)) yield * snapshotFiles(root, file)
-    else if (entry.isFile() && (configPattern.test(entry.name) || /\.(?:[cm]?[jt]sx?|cs)$/i.test(entry.name) || /^(?:README|SECURITY|CONTRIBUTING)\.md$/i.test(entry.name))) yield file
+    if (entry.isSymbolicLink() || privateFile.test(file) || (entry.isDirectory() && excluded.has(entry.name))) {
+      await store?.execute('INSERT OR REPLACE INTO snapshot_omissions VALUES (?,?,NULL)', [file, entry.isSymbolicLink() ? 'symlink' : privateFile.test(file) ? 'private_file_policy' : 'generated_or_installed_directory'])
+      continue
+    }
+    if (entry.isDirectory()) yield * snapshotFiles(root, file, store)
+    else if (entry.isFile()) {
+      const size = (await stat(path.join(root, file))).size
+      if (/(^|\/)(public|wwwroot|static|assets|ftp)(\/|$)/i.test(file)) await store?.execute('INSERT OR REPLACE INTO public_assets VALUES (?,?,?)', [file, size, path.extname(file)])
+      if (configPattern.test(entry.name) || templatePattern.test(entry.name) || contextPattern.test(entry.name) || /\.(?:[cm]?[jt]sx?|cs)$/i.test(entry.name) || /^(?:README|SECURITY|CONTRIBUTING)\.md$/i.test(entry.name)) {
+        if (size > defaultLimits.maxFileBytes) { await store?.execute('INSERT OR REPLACE INTO snapshot_omissions VALUES (?,?,?)', [file, 'file_size_limit', size]); continue }
+        yield file
+      } else await store?.execute('INSERT OR REPLACE INTO snapshot_omissions VALUES (?,?,?)', [file, 'unsupported_content_metadata_only', size])
+    }
   }
-}
-
-function purpose (file: string): string {
-  if (/(^|\/)(test|tests|__tests__|fixtures|__fixtures__|mocks|__mocks__)(\/|$)|\.(test|spec|stories)\./i.test(file)) return 'test_or_fixture'
-  if (/(^|\/)(examples|docker-examples|tools|scripts)(\/|$)/.test(file)) return 'example_or_tooling'
-  return 'application_candidate'
 }
 
 export async function importDataset (datasetPath: string, sourcePath: string, runPath: string): Promise<Record<string, unknown>> {
@@ -59,6 +68,7 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
       const previous = await store.get<string>('datasetId')
       if (previous && previous !== datasetId) throw new Error('different_dataset')
       if (await store.get('importComplete')) {
+        if (await store.get('snapshotPolicy') !== snapshotPolicy) throw new Error('snapshot_policy_changed_requires_new_run')
         for await (const file of store.scan('files')) {
           if (await fileHash(source, String(file.path)) !== file.hash) throw new Error('source_hash_mismatch')
         }
@@ -67,13 +77,23 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
       }
       await store.set('datasetId', datasetId)
       await store.set('importComplete', false)
+      if ((await store.query('SELECT id FROM tasks LIMIT 1')).length) throw new Error('cannot_replace_planned_snapshot')
+      await store.execute('DELETE FROM candidates')
+      await store.execute('DELETE FROM review_subjects')
       await store.execute('DELETE FROM answers')
       await store.execute('DELETE FROM functions')
+      await store.execute('DELETE FROM file_context')
+      await store.execute('DELETE FROM snapshot_omissions')
+      await store.execute('DELETE FROM public_assets')
       await store.execute('DELETE FROM files')
+      let capturedBytes = 0
       const snapshotRoot = path.join(run, 'snapshot/source')
       await mkdir(snapshotRoot, { recursive: true, mode: 0o700 })
       async function capture (file: string, expected?: string): Promise<void> {
+        if (privateFile.test(file)) throw new Error('private_file_in_inventory')
         const bytes = await readBounded(source, file, defaultLimits.maxFileBytes)
+        capturedBytes += bytes.length
+        if (capturedBytes > 512 * 1024 * 1024) throw new Error('snapshot_total_size_limit')
         const digest = hash(bytes)
         if (expected && digest !== expected) throw new Error('source_hash_mismatch')
         const target = path.join(snapshotRoot, relativePath(file))
@@ -84,7 +104,7 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
           exists = false
         }
         if (!exists) { await writeFile(target, bytes, { mode: 0o400, flag: 'wx' }); await chmod(target, 0o400) }
-        const language = /\.[cm]?[jt]sx?$/i.test(file) ? 'tsjs' : /\.cs$/i.test(file) ? 'csharp' : /\.md$/i.test(file) ? 'documentation' : 'configuration'
+        const language = /\.[cm]?[jt]sx?$/i.test(file) ? 'tsjs' : /\.cs$/i.test(file) ? 'csharp' : templatePattern.test(file) ? 'template' : /\.md$/i.test(file) ? 'documentation' : 'configuration'
         await store.execute('INSERT INTO files VALUES (?,?,?,?) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash,bytes=excluded.bytes', [file, digest, bytes.length, language])
       }
       for await (const raw of jsonArray(dataset, 'inventory.json', 'files')) {
@@ -92,7 +112,7 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
         await capture(file.file, file.sourceHash)
       }
       let additionalSourceFiles = 0
-      for await (const file of snapshotFiles(source)) {
+      for await (const file of snapshotFiles(source, '', store)) {
         if ((await store.query('SELECT path FROM files WHERE path=?', [file])).length) continue
         await capture(file)
         if (/\.(?:[cm]?[jt]sx?|cs)$/i.test(file)) additionalSourceFiles++
@@ -122,7 +142,7 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
             record.function.length !== record.sanitizedFunction.length) throw new Error('function_source_mismatch')
           if (sanitizedText.slice(record.start.offset, record.end.offset) !== record.sanitizedFunction) throw new Error('sanitized_implementation_mismatch')
         const artifact = await putArtifact(run, record)
-        await store.execute('INSERT INTO functions VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?)', [record.id, record.file, record.name, record.kind, record.start.offset, record.end.offset, record.parentId, record.sourceHash, record.sanitizedSourceHash, artifact, purpose(record.file)])
+        await store.execute('INSERT INTO functions VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?)', [record.id, record.file, record.name, record.kind, record.start.offset, record.end.offset, record.parentId, record.sourceHash, record.sanitizedSourceHash, artifact, pathPurpose(record.file).purpose])
         functionCount++
       }
       let classificationCount = 0
@@ -139,15 +159,17 @@ export async function importDataset (datasetPath: string, sourcePath: string, ru
         classificationCount++
       }
       if (classificationCount !== manifest.functionCount || functionCount < classificationCount) throw new Error('dataset_count_mismatch')
-      const fingerprint = createHash('sha256').update(datasetId)
+      await recordPurposes(store, snapshotRoot)
+      const fingerprint = createHash('sha256').update(datasetId).update(snapshotPolicy)
       for await (const file of store.scan('files')) fingerprint.update(JSON.stringify([file.path, file.hash]) + '\n')
       const snapshotId = fingerprint.digest('hex')
-      const saved = { schemaVersion: 1, datasetId, snapshotId, repository: manifest.repository, revision: manifest.revision, model: manifest.model, questionsHash: manifest.questionsHash, functionCount, classificationCount, additionalSourceFiles, importedAt: new Date().toISOString(), sourceRoot: source }
+      const saved = { schemaVersion: 1, datasetId, snapshotId, snapshotPolicy, capturedBytes, repository: manifest.repository, revision: manifest.revision, model: manifest.model, questionsHash: manifest.questionsHash, functionCount, classificationCount, additionalSourceFiles, importedAt: new Date().toISOString(), sourceRoot: source, disclosureCaveat: 'Templates and configuration may contain literal secrets. Private filename exclusions are not content redaction.' }
       await atomicJson(path.join(run, 'inputs/dataset.json'), manifest)
       await atomicJson(path.join(run, 'inputs/questions.snapshot.json'), questions)
       await atomicJson(path.join(run, 'manifest.json'), saved)
       await store.set('manifest', saved)
       await store.set('snapshotId', snapshotId)
+      await store.set('snapshotPolicy', snapshotPolicy)
       await store.set('importComplete', true)
       return { status: 'imported', ...saved }
     } finally { csharp.close(); await store.close() }

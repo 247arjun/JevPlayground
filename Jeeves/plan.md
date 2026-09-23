@@ -4,6 +4,8 @@ Status: design only. No implementation, dependency installation, model calls, or
 
 Implementation note: a first working implementation now exists under this folder following separate user authorization. See `README.md` for executable commands, measured checks, and capability limitations. The stages and acceptance criteria below remain the intended destination, not a claim that all release gates have passed.
 
+Coverage revision: full candidate discovery and full declared-scope review now replace pilot-sized defaults. Sampling is an explicit experiment mode, not a whole-repository assessment. The implementation adds a persisted candidate catalogue, non-function subjects, templates/configuration evidence, indexed scoped search, reviewed follow-ups, and cumulative operator-approved run budgets. Existing Jev answers are reused; changed snapshot/planner/prompt policies require fresh runs. See the README for current commands and the version-pinned source-review benchmark. No live recall, precision, hostile-code sandbox or complete semantic-coverage guarantee follows from offline tests or queue completion.
+
 ## 1. Objective
 
 Build a classification-guided, multi-agent security investigation system for C# and TypeScript/JavaScript services, with Azure-aware framework and deployment analysis.

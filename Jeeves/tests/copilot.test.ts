@@ -53,7 +53,7 @@ test('an idle session gets one finalization turn within its original deadline', 
   assert.equal(prompts.length, 2)
   assert.match(prompts[1]!, /No validated submit_result/)
   assert.ok(deadlines[0]! <= 1000 && deadlines[1]! <= deadlines[0]!)
-  assert.equal(backend.identity.promptVersion, 'roles-v2')
+  assert.equal(backend.identity.promptVersion, 'roles-v3-review')
   assert.equal(closed, true)
 })
 

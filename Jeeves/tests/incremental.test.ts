@@ -8,6 +8,7 @@ import { importDataset } from '../src/datasets/import.js'
 import { buildIndex, callPage } from '../src/analysis/index.js'
 import { Store } from '../src/storage/store.js'
 import { hash } from '../src/security.js'
+import { planTasks } from '../src/orchestration/tasks.js'
 
 test('new snapshots reuse only unchanged syntax and invalidate semantic caches', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-incremental-'))
@@ -47,5 +48,25 @@ test('new snapshots reuse only unchanged syntax and invalidate semantic caches',
       assert.equal((await store.query('SELECT COUNT(*) AS count FROM semantic_results'))[0]?.count, 0)
       assert.equal((await store.query('SELECT COUNT(*) AS count FROM calls WHERE name=?', ['lookup']))[0]?.count, 1)
     } finally { await store.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('refusing a changed index policy preserves an already planned run', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-index-identity-'))
+  try {
+    const paths = await fixture(root)
+    await importDataset(paths.dataset, paths.source, paths.run); await buildIndex(paths.run)
+    const store = await Store.open(paths.run)
+    try {
+      await planTasks(store)
+      await store.set('indexGeneration', 'historical-generation')
+      await store.set('indexBuilding', null)
+    } finally { await store.close() }
+    await assert.rejects(buildIndex(paths.run), /index_policy_changed_requires_new_run/)
+    const saved = await Store.open(paths.run, true)
+    try {
+      assert.equal(await saved.get('indexGeneration'), 'historical-generation')
+      assert.ok((await saved.query('SELECT id FROM tasks LIMIT 1')).length)
+    } finally { await saved.close() }
   } finally { await rm(root, { recursive: true, force: true }) }
 })

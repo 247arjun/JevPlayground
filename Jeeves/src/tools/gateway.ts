@@ -4,10 +4,12 @@ import { z } from 'zod'
 import { defineTool, type SessionConfig } from '@github/copilot-sdk'
 import { defaultLimits, resultSchema, type AgentResult, type Citation, type Limits, type Row } from '../domain.js'
 import { errorCode, hash, readBounded } from '../security.js'
-import { Store, putArtifact } from '../storage/store.js'
+import { Store, getArtifact, putArtifact } from '../storage/store.js'
 import { Navigation } from '../analysis/navigation.js'
 import { maskComments } from '../analysis/syntax.js'
 import { frameworkEvidence } from '../models.js'
+import { contextPage, searchSnapshot } from '../analysis/context.js'
+import { reviewThemes } from '../orchestration/tasks.js'
 
 export class Gateway {
   private calls = 0
@@ -20,6 +22,7 @@ export class Gateway {
   private served: Citation[] = []
   private providerUsage: Array<{ id: string, model: string, inputTokens: number | null, outputTokens: number | null, costMultiplier: number | null }> = []
   private sourceCache?: { file: string, hash: string, original: string, sanitized: string }
+  onProviderUsage?: (entry: { id: string, model: string, inputTokens: number | null, outputTokens: number | null, costMultiplier: number | null }) => void
   accepted?: AgentResult
   constructor (readonly store: Store, readonly navigation: Navigation, readonly task: Row, readonly limits: Limits = defaultLimits) {
     this.deadline = Date.now() + limits.modelTimeoutMs
@@ -44,6 +47,13 @@ export class Gateway {
     const original = (await readBounded(path.join(this.store.root, 'snapshot/source'), file, this.limits.maxFileBytes)).toString()
     if (hash(original) !== record.hash) throw new Error('snapshot_hash_mismatch')
     let sanitized = record.language === 'tsjs' ? maskComments(file, original) : original
+    if (!['tsjs', 'csharp'].includes(String(record.language))) {
+      const context = (await this.store.query('SELECT artifact FROM context_text WHERE file=?', [file]))[0]
+      if (!context) throw new Error('context_parser_unavailable')
+      const derived = await getArtifact<{ sourceHash: string, sanitized: string }>(this.store.root, String(context.artifact))
+      if (derived.sourceHash !== record.hash || derived.sanitized.length !== original.length) throw new Error('context_source_mismatch')
+      sanitized = derived.sanitized
+    }
     if (record.language === 'csharp') {
       const comments = await this.navigation.csharp.request('comments', { file }) as { ranges: Array<{ start: number, end: number }> }
       const pieces: string[] = []; let cursor = 0
@@ -73,16 +83,25 @@ export class Gateway {
     if (this.closed || this.accepted) throw new Error('result_already_submitted')
     const result = resultSchema.parse(raw)
     const citations = [...result.facts, ...result.counterevidence].flatMap(item => item.citations)
+    for (const edge of result.flow ?? []) citations.push(edge.from, edge.to)
+    for (const proposal of result.followUps ?? []) citations.push(proposal.operation)
     if (result.operation) citations.push(result.operation)
     for (const citation of citations) {
       if (citation.end <= citation.start || !this.served.some(item => item.file === citation.file && item.sourceHash === citation.sourceHash && item.start <= citation.start && item.end >= citation.end)) throw new Error('citation_not_observed')
       const source = await this.source(citation.file)
       if (source.hash !== citation.sourceHash || citation.end > source.original.length) throw new Error('citation_hash_mismatch')
     }
+    for (const proposal of result.followUps ?? []) {
+      if (!reviewThemes.has(proposal.theme)) throw new Error('unknown_review_theme')
+      const subject = (await this.store.query('SELECT file,start,end FROM review_subjects WHERE id=?', [proposal.subjectId]))[0]
+      if (!subject || subject.file !== proposal.operation.file || Number(subject.start) > proposal.operation.start || Number(subject.end) < proposal.operation.end) throw new Error('followup_outside_subject')
+      const anchor = (await this.store.query('SELECT kind FROM source_anchors WHERE file=? AND start=? AND end=? UNION ALL SELECT name AS kind FROM calls WHERE file=? AND start=? AND end=? LIMIT 1', [proposal.operation.file, proposal.operation.start, proposal.operation.end, proposal.operation.file, proposal.operation.start, proposal.operation.end]))[0]
+      if (!anchor && (Number(subject.start) !== proposal.operation.start || Number(subject.end) !== proposal.operation.end)) throw new Error('followup_not_parsed_anchor')
+    }
     if (result.disposition === 'supported_candidate' && (!result.operation || !result.facts.length || !result.invariant.trim())) throw new Error('unsupported_candidate')
     if (this.task.role === 'localizer' && result.disposition !== 'no_relevant_operation' && result.disposition !== 'budget_exhausted' && !result.operation) throw new Error('operation_required')
     if (result.operation) {
-      const owner = (await this.store.query('SELECT file,start,end FROM functions WHERE id=?', [String(this.task.function_id)]))[0]
+      const owner = (await this.store.query('SELECT s.file,s.start,s.end,s.kind FROM candidates c JOIN review_subjects s ON s.id=c.subject_id WHERE c.id=?', [String(this.task.id)]))[0] ?? (await this.store.query("SELECT file,start,end,'function' AS kind FROM functions WHERE id=?", [String(this.task.function_id)]))[0]
       if (!owner || owner.file !== result.operation.file || result.operation.start < Number(owner.start) || result.operation.end > Number(owner.end)) throw new Error('operation_outside_function')
       if (/\.[cm]?[jt]sx?$/.test(result.operation.file)) {
         const source = await this.source(result.operation.file)
@@ -97,6 +116,10 @@ export class Gateway {
       } else if (/\.cs$/.test(result.operation.file)) {
         const resultSpan = await this.navigation.csharp.request('locate', { file: result.operation.file, start: result.operation.start, end: result.operation.end }) as { found: boolean }
         if (!resultSpan.found) throw new Error('operation_not_syntax_node')
+      } else {
+        const exactSubject = result.operation.start === Number(owner.start) && result.operation.end === Number(owner.end)
+        const anchor = (await this.store.query('SELECT kind FROM source_anchors WHERE file=? AND start=? AND end=? LIMIT 1', [result.operation.file, result.operation.start, result.operation.end]))[0]
+        if (!anchor && !exactSubject) throw new Error('operation_not_parsed_anchor')
       }
     }
     if (this.closed || this.accepted) throw new Error('result_already_submitted')
@@ -150,21 +173,27 @@ export class Gateway {
         const source = await this.source(input.file)
         return /\.cs$/.test(input.file) ? await this.navigation.csharp.request('framework', { file: input.file }) : frameworkEvidence(input.file, source.sanitized)
       }) }),
-      defineTool('search_snapshot', { description: 'Bounded literal search over snapshot files for unresolved relationships. Returns candidate locations; read them to verify.', parameters: z.object({ text: z.string().min(1).max(200), after: z.string().default('') }).strict(), handler: wrap(async input => {
-        const files = await this.store.query('SELECT path FROM files WHERE path>? ORDER BY path LIMIT 30', [input.after])
-        const matches: unknown[] = []
-        for (const file of files) {
-          const source = await this.source(String(file.path)); let offset = 0; let count = 0
-          while ((offset = source.sanitized.indexOf(input.text, offset)) >= 0 && ++count <= 20) { matches.push({ file: file.path, start: offset, end: offset + input.text.length }); offset += input.text.length }
-        }
-        return { matches, nextFile: files.at(-1)?.path ?? null, completion: 'partial', reasons: ['literal_candidates_only', 'per_file_match_limit'] }
+      defineTool('search_snapshot', { description: 'Indexed literal search with optional path prefix. Follow the generation-bound cursor, including empty pages. Returns candidate UTF-16 locations; read_source is required before citing.', parameters: z.object({ text: z.string().min(3).max(200), prefix: z.string().max(1024).default(''), cursor: z.string().max(4096).optional(), limit: z.number().int().min(1).max(50).default(30) }).strict(), handler: wrap(async input => await searchSnapshot(this.store, input.text, input.prefix, input.cursor, input.limit)) }),
+      defineTool('inspect_context', { description: 'Page parsed template/configuration/declaration anchors. HTML bindings and plain-text interpolation are different contexts; an anchor is not a finding.', parameters: z.object({ file: z.string().max(1024), cursor: z.string().max(4096).optional() }).strict(), handler: wrap(async input => await contextPage(this.store, input.file, 'anchors', input.cursor)) }),
+      defineTool('inspect_relationships', { description: 'Page incoming/outgoing declared imports, routes, middleware order, persistence calls, and component/template links. Read source to verify each relationship; none proves execution or authorization.', parameters: z.object({ file: z.string().max(1024), cursor: z.string().max(4096).optional() }).strict(), handler: wrap(async input => await contextPage(this.store, input.file, 'relationships', input.cursor)) }),
+      defineTool('list_subjects', { description: 'Page review subject IDs and ranges in one file, including functions, templates and configuration. Use these IDs when proposing a separate defensive follow-up.', parameters: z.object({ file: z.string().max(1024), after: z.string().max(2048).default('') }).strict(), handler: wrap(async input => {
+        const rows = await this.store.query('SELECT id,file,start,end,kind,purpose FROM review_subjects WHERE file=? AND id>? ORDER BY id LIMIT 51', [input.file, input.after])
+        return { subjects: rows.slice(0, 50), after: rows.length > 50 ? rows[49]!.id : null }
+      }) }),
+      defineTool('list_public_assets', { description: 'Page metadata only for declared public/static resources. File names do not prove public exposure or sensitive content.', parameters: z.object({ after: z.string().max(2048).default('') }).strict(), handler: wrap(async input => {
+        const rows = await this.store.query('SELECT * FROM public_assets WHERE path>? ORDER BY path LIMIT 51', [input.after])
+        return { assets: rows.slice(0, 50), after: rows.length > 50 ? rows[49]!.path : null, limitation: 'Metadata only; confirm serving rules and policy in source.' }
       }) }),
       defineTool('submit_result', { description: 'Submit the final structured evidence-backed result. Cite only spans read through read_source, using its original file hash. Do not claim reproduction.', parameters: resultSchema, handler: wrap(async input => { await this.accept(input); return { accepted: true } }, { final: true }) })
     ]
   }
   close (): void { this.closed = true; this.sourceCache = undefined }
   recordUsage (value: { id: string, model: string, inputTokens?: number, outputTokens?: number, cost?: number }): boolean {
-    if (!this.providerUsage.some(item => item.id === value.id)) this.providerUsage.push({ id: value.id, model: value.model, inputTokens: value.inputTokens ?? null, outputTokens: value.outputTokens ?? null, costMultiplier: value.cost ?? null })
+    if (!this.providerUsage.some(item => item.id === value.id)) {
+      const entry = { id: value.id, model: value.model, inputTokens: value.inputTokens ?? null, outputTokens: value.outputTokens ?? null, costMultiplier: value.cost ?? null }
+      this.providerUsage.push(entry)
+      this.onProviderUsage?.(entry)
+    }
     return this.providerUsage.length >= this.limits.maxProviderRequests
   }
   usage (): Record<string, unknown> { return { toolCalls: this.calls, rejectedToolCalls: this.rejectedCalls, toolErrors: { ...this.toolErrors }, returnedBytes: this.bytes, providerCalls: this.providerUsage, tokenUsageComplete: this.providerUsage.length > 0 && this.providerUsage.every(item => item.inputTokens !== null && item.outputTokens !== null) } }

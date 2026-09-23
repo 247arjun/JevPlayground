@@ -7,8 +7,9 @@ import { withRunLock } from '../storage/lock.js'
 import { syntaxIndex } from './syntax.js'
 import { CSharp } from './csharp.js'
 import { SyntaxWorker } from './syntax-client.js'
+import { buildContextIndex } from './context.js'
 
-const indexVersion = 'syntax-v5'
+const indexVersion = 'syntax-v6-context-v3'
 
 export async function buildIndex (run: string, reuseRun?: string): Promise<Record<string, unknown>> {
   if (reuseRun && path.resolve(reuseRun) === path.resolve(run)) throw new Error('reuse_run_must_be_different')
@@ -23,14 +24,15 @@ export async function buildIndex (run: string, reuseRun?: string): Promise<Recor
       const generation = hash(JSON.stringify([snapshotId, indexVersion, ts.version, 'roslyn-4.11.0']))
       const previousStats = await store.get<{ incompleteFiles?: number }>('indexStats')
       if (await store.get('indexGeneration') === generation && !previousStats?.incompleteFiles) return { status: 'already_indexed', generation }
+      if (await store.get('indexBuilding') !== generation && (await store.query('SELECT id FROM tasks LIMIT 1')).length) throw new Error('index_policy_changed_requires_new_run')
       await store.set('indexGeneration', null)
       if (await store.get('indexBuilding') !== generation) {
-        await store.batch(['calls', 'registrations', 'projects', 'semantic_results', 'coverage', 'index_batches'].map(table => ({ sql: `DELETE FROM ${table}` })))
+        await store.batch(['calls', 'registrations', 'projects', 'semantic_results', 'coverage', 'index_batches', 'context_files', 'context_text', 'source_anchors', 'relationships', 'source_search', 'candidates', 'review_subjects'].map(table => ({ sql: `DELETE FROM ${table}` })))
         await store.set('indexBuilding', generation)
       }
       await store.set('indexVersion', indexVersion)
       if (reuseRun) {
-        previousStore = await Store.open(path.resolve(reuseRun))
+        previousStore = await Store.open(path.resolve(reuseRun), true)
         if (await previousStore.get('indexVersion') !== indexVersion || !await previousStore.get('indexGeneration')) throw new Error('reuse_index_incompatible')
       }
       let reusedFiles = 0; let reusedFromPrevious = 0; let parsedFiles = 0
@@ -101,6 +103,7 @@ export async function buildIndex (run: string, reuseRun?: string): Promise<Recor
         await store.execute('INSERT OR REPLACE INTO index_batches VALUES (?,?,?)', [generation, relative, String(file.hash)])
         parsedFiles++
       }
+      await buildContextIndex(store, syntax, csharp)
       const files = Number((await store.query("SELECT COUNT(*) AS count FROM coverage WHERE capability!='unavailable'"))[0]!.count)
       const callCount = Number((await store.query('SELECT COUNT(*) AS count FROM calls'))[0]!.count)
       const incompleteFiles = Number((await store.query('SELECT COUNT(*) AS count FROM files WHERE NOT EXISTS (SELECT 1 FROM index_batches WHERE index_batches.generation=? AND index_batches.file=files.path)', [generation]))[0]!.count)

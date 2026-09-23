@@ -7,6 +7,10 @@ import { syntaxIndex, traceLocalValue } from '../src/analysis/syntax.js'
 import { callPage } from '../src/analysis/index.js'
 import { Workspaces } from '../src/analysis/workspaces.js'
 import { Store } from '../src/storage/store.js'
+import { contextEvidence, searchSnapshot } from '../src/analysis/context.js'
+import { importDataset } from '../src/datasets/import.js'
+import { buildIndex } from '../src/analysis/index.js'
+import { fixture } from './fixtures.js'
 
 test('syntax calls preserve nesting and registration is not invocation', () => {
   const result = syntaxIndex('code.ts', 'import { app } from "@azure/functions"; function factory() { return () => fetch("https://example.test") } app.http("example", {handler:factory()});')
@@ -71,4 +75,54 @@ test('shared semantic worker resolves imported aliases with one cold load', asyn
     assert.ok(callers.reasons.includes('unsearched_projects_and_external_consumers'))
     assert.equal(pool.metrics.loads, 1)
   } finally { pool.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('context parsers preserve offsets and distinguish HTML bindings from escaped text', () => {
+  const html = '<!-- private hint --><p>{{ value }}</p><div [innerHTML]="value"></div>'
+  const evidence = contextEvidence('view.html', html, 'template')
+  assert.equal(evidence.sanitized.length, html.length)
+  assert.ok(!evidence.sanitized.includes('private hint'))
+  assert.equal(evidence.anchors.filter(anchor => anchor.data.htmlBinding).length, 1)
+  const yaml = 'limits:\n  attempts: 3 # hint\n'
+  const configuration = contextEvidence('config.yml', yaml, 'configuration')
+  assert.equal(configuration.sanitized.length, yaml.length)
+  assert.ok(!configuration.sanitized.includes('hint'))
+  assert.ok(configuration.anchors.length > 0)
+  const routing = contextEvidence('server.ts', 'import { handler } from "./route"; app.get("/resource", wrap(handler()));', 'tsjs')
+  assert.equal(routing.relationships.find(relation => relation.kind === 'route_handler')?.target, './route')
+  assert.ok(contextEvidence('invalid.ts', 'export function broken(', 'tsjs').reasons.includes('typescript_parse_error'))
+  assert.ok(contextEvidence('invalid.json', '{"value":', 'configuration').reasons.includes('json_parse_error'))
+})
+
+test('indexed search reaches late files and relationships connect source to templates', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'jeeves-context-index-'))
+  try {
+    const paths = await fixture(root)
+    await writeFile(path.join(paths.source, 'component.ts'), 'const component = { templateUrl: "./view.html" }; export const needle = 1')
+    await writeFile(path.join(paths.source, 'view.html'), '<p>{{ needle }}</p>')
+    await writeFile(path.join(paths.source, 'z.ts'), 'export const needle = 2; const another = "needle"')
+    await mkdir(path.join(paths.source, 'fixtures'))
+    await writeFile(path.join(paths.source, 'fixtures/handler.ts'), 'export const handler = () => true')
+    await writeFile(path.join(paths.source, 'server.ts'), 'import { handler } from "./fixtures/handler"; app.get("/resource", wrap(handler));')
+    await importDataset(paths.dataset, paths.source, paths.run); await buildIndex(paths.run)
+    const store = await Store.open(paths.run)
+    try {
+      const matches: unknown[] = []; let cursor: string | undefined
+      do {
+        const page = await searchSnapshot(store, 'needle', '', cursor, 1)
+        matches.push(...page.matches as unknown[]); cursor = page.cursor as string | undefined
+      } while (cursor)
+      assert.equal(matches.length, 4)
+      const scoped = await searchSnapshot(store, 'needle', 'z.ts')
+      assert.equal((scoped.matches as unknown[]).length, 2)
+      assert.equal((await store.query('SELECT target FROM relationships WHERE kind=?', ['component_template']))[0]?.target, 'view.html')
+      const purpose = (await store.query('SELECT purpose,data FROM file_context WHERE file=?', ['fixtures/handler.ts']))[0]!
+      assert.equal(purpose.purpose, 'application_candidate')
+      assert.equal(JSON.parse(String(purpose.data)).originalPathPurpose, 'test_or_fixture')
+      assert.ok((await store.query('SELECT id FROM review_subjects WHERE kind=?', ['template'])).length)
+      const first = await searchSnapshot(store, 'needle', '', undefined, 1)
+      await store.set('indexGeneration', 'changed')
+      await assert.rejects(searchSnapshot(store, 'needle', '', String(first.cursor)), /stale_or_foreign_cursor/)
+    } finally { await store.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
 })

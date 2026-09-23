@@ -31,17 +31,25 @@ node Jeeves/dist/src/cli.js import \
   --run Jeeves/runs/review-001
 
 node Jeeves/dist/src/cli.js index --run Jeeves/runs/review-001
-node Jeeves/dist/src/cli.js plan --run Jeeves/runs/review-001 --max-operations 25
+node Jeeves/dist/src/cli.js plan --run Jeeves/runs/review-001 --mode full
 node Jeeves/dist/src/cli.js status --run Jeeves/runs/review-001
 ```
 
 The importer accepts the version-1 dataset manifest used by the existing classifier: `dataset.json`, its checksummed `inventory.json`, rubric snapshot, function JSONL, and classification JSON array. Manifest filenames are used instead of hardcoding a target. It validates file sizes/hashes, source spans, sanitized hashes, answer labels/distributions and counts. Partial imports can be replayed idempotently; a different dataset requires a new run directory.
 
-Imports snapshot the classified source, additional TS/JS/C# source, selected project/configuration files, and README/security/contribution documents. Additional source is reported separately and is not treated as Jev-classified. Environment files, installed dependencies, build output and escaping symlinks are not copied. Relevant configuration can contain literal secrets; review the source-disclosure policy before a live run. A snapshot makes the input stable but does not make it public or safe to transmit. Imported sanitized implementations are independently checked against parser-based comment masking, rather than trusting their hashes alone.
+Imports snapshot the classified source, additional TS/JS/C# source, templates, JSON/YAML and other declared configuration, and README/security/contribution documents. Public/static resources also have a metadata inventory. Additional source is reported separately and is not treated as Jev-classified. Environment/key/credential-named files, installed dependencies, build output and symlinks are excluded explicitly. Capture is bounded to 16 MiB per file and 512 MiB total; omissions are recorded, and exceeding the total stops import. Relevant configuration can contain literal secrets despite filename exclusions; review the source-disclosure policy before a live run. A snapshot makes input stable, not public or redacted. Imported sanitized implementations are independently checked against parser-based comment masking.
+
+The expanded `source-and-context-v2` snapshot policy requires a fresh run for old datasets. The original Jev dataset and all successful classification answers are reused unchanged; Jeeves does not call Jev. Changed snapshot/index/planning/prompt identities cannot be mixed into an old investigation. Previous-run syntax reuse and `status` open the database read-only.
 
 The index stores syntactic call and registration candidates, checkpointed by completed file. Interrupted generations replay only incomplete files. Semantic programs are loaded only when a tool explicitly requests a project context. A name-based reverse lookup is deliberately labeled incomplete. The additional `find_semantic_callers` tool follows compiler-resolved targets within one selected TS/JS or C# project and pages its progress; other projects, dynamic dispatch and external consumers remain explicit gaps. `trace_local_value` returns operand declarations, parameter boundaries, candidate writes and enclosing conditions, not a path-sensitive taint proof.
 
-Triage uses explicit operation/influence combinations and a reproducible control sample, not an aggregate vulnerability score. A maximum-25 plan currently selects at most one theme per function, reserves about 20% for controls, and keeps code-purpose labels. Localization deduplication across different parent/callback tasks is not yet implemented; inspect repeated operation spans in reports.
+Planning defaults to **full review**, with no 25/50/200 candidate cutoff. Every eligible function/theme and parsed non-function subject is persisted in a candidate catalogue. Functions without a matching signal receive a general-review obligation; uncertain signals are retained. Multiple themes per function are allowed. Cryptography, recovery, ownership, redirects, resource limits, parsing, business policy and disclosure have explicit review contracts. Ownership reviews do not require an existing authorization check to be classified present.
+
+Path and project-configuration evidence distinguishes application candidates, initialization, fixtures, tooling and vendor material. These are declared-purpose heuristics, not runtime proof. An application route's imported handler reference overrides a path-only exclusion while retaining both pieces of evidence. Exclusions remain visible in the catalogue; `--include-non-application` expands the declared scope. Build exclusion alone never establishes safety. Request-input signals and declared route relationships affect order, not full-review inclusion.
+
+Use `plan --run RUN --mode sample --max-operations N` only for a deliberately sampled experiment. Selection uses evidence priority and file/theme diversity rather than alphabetical truncation, with about 20% deterministic controls when available. All unselected candidates remain `deferred`. There is no fixed upper candidate limit. Exact subject/theme identity prevents duplicate task insertion; final identical operation/theme spans are grouped without deleting parent or caller evidence. These groups are not distinct-vulnerability counts, and semantic deduplication across different operations still requires review.
+
+Context indexing uses bounded parser workers for TS declarations, HTML anchors, and JSON/YAML configuration. It records declared imports, component/template links, route/middleware arguments and imported Finale CRUD registrations. The scoped `inspect_context`, `inspect_relationships`, `list_subjects`, and `list_public_assets` tools return evidence candidates. `search_snapshot` uses a local trigram index with path prefixes and generation-bound pagination instead of scanning the first alphabetical files on every call. Short searches require at least three characters. Framework relationships are not executable call-graph or dataflow proofs; parser failures, unsupported formats and files without reviewable declarations remain explicit gaps. C# source is comment-masked for search; unclassified C# files get a source-file review obligation with Roslyn operation validation, while cross-framework relationship coverage remains partial.
 
 ## Live Investigation
 
@@ -51,6 +59,7 @@ node Jeeves/dist/src/cli.js run \
   --model gpt-5-mini \
   --workers 2 \
   --config Jeeves/config/defaults.json \
+  --max-run-hours 4 \
   --allow-live
 
 node Jeeves/dist/src/cli.js report --run Jeeves/runs/review-001
@@ -62,7 +71,9 @@ Each operation progresses through isolated localizer, investigator and challenge
 
 Investigation agents cannot mark a finding as locally reproduced. They submit `needs_context`, `supported_candidate`, `refuted_hypothesis`, `no_relevant_operation` or `budget_exhausted`. The validation executor records raw observations separately and requires review.
 
-Default limits include 75 role-session calls per run, 20 observed provider requests per session, 40 admitted tool calls per attempt and a 120-second model deadline. One tool slot is reserved for structured submission. Tool results expose remaining retrieval, provider, byte and time budgets; retrieval closes near the provider/deadline boundary so the agent can submit unresolved evidence. An idle session without an accepted result gets at most one submission-only reminder within the same request budget and original deadline. This is not a fresh role attempt or a budget reset. Already validated results survive subsequent shutdown or provider-budget cancellation; late results after cancellation are rejected.
+There is no default run-wide session/candidate cap. A live command requires an explicit overall budget: `--max-run-hours`, `--max-role-calls`, `--max-run-requests`, or corresponding non-null config values. The four-hour example is illustrative, not a required limit. Time is cumulative active run time; an unclean shutdown conservatively charges time until recovery. Session attempts and observed provider usage persist across resumes. A reached overall budget leaves unfinished tasks queued with an explicit pause reason, not falsely completed.
+
+Default per-attempt limits remain 20 observed provider requests, 40 admitted tool calls and a 120-second deadline, with two workers. `--attempt-seconds` permits an explicitly approved longer attempt up to the configured schema bound; worker, byte and heap limits still apply. One tool slot is reserved for structured submission. Tool results expose remaining budgets; retrieval closes near the provider/deadline boundary so the agent can submit unresolved evidence. An idle session without an accepted result gets at most one submission-only reminder within the same budget and original deadline. Already validated results survive subsequent shutdown or provider-budget cancellation; late results after cancellation are rejected.
 
 `read_source` caps an overshooting end offset at EOF and returns the actual citation span and file length. Source withheld by output limits is not valid citation evidence. Safe error counts and rejected tool calls are recorded separately from admitted calls, without raw error bodies. SDK usage events are recorded without prompt content; absent token fields remain unknown. Session-call counts and provider cost multipliers are not currency totals. An optional `maxAiCreditsPerSession` uses the SDK's provider-side limit when supported. The observed request guard aborts when its boundary event arrives and is not a prebilling exactly-once guarantee; retain provider/account quotas. Authentication, billing and rate-limit errors stop further task admission. Unsubmitted exhausted work remains queued or failed, and the CLI exits nonzero when tasks are not completed. An accepted `budget_exhausted` result is still inconclusive, even when its task is completed.
 
@@ -79,7 +90,22 @@ node Jeeves/dist/src/cli.js resume \
 
 Explicit `--retry-failed` retries a failed role only while it has fewer than three recorded attempts. Expired running leases are fenced and requeued. Run-level call usage is retained. To recover a stale coordinator lock, use `resume --run ... --recover-lock`; it refuses when the recorded owner process is alive. Do not manually delete a live lock.
 
-Reports are streamed to `reports/investigations.json`, `reports/summary.md`, and `reports/coverage.json`. They include unresolved/failed tasks and capability caveats. Task events and all accepted stage artifacts remain in SQLite/artifact storage even though the summary shows the most recent result. Back up a stopped run after SQLite checkpoints; do not copy a live main database file without its WAL.
+`resume --continue-inconclusive` is an explicit request to revisit accepted `needs_context` or `budget_exhausted` results, retaining prior evidence and limiting repeated role attempts. Supply approved budget/attempt overrides when needed; neither continuation nor retry resets accumulated usage. Without an explicit config, resume reuses the recorded limits.
+
+Agents may submit up to five separately cited `followUps` and explicit cross-boundary `flow` records. Proposals are source/anchor validated, deduplicated, and depth-limited to three; they never silently start more live work. Inspect `reports/followups.jsonl`, then use `approve-followups --run RUN --followups ID[,ID...] --approve-followups` to admit the chosen proposals. Approved subjects are anchored to the exact cited operation and preserve the originating subject/rationale, so another operation in the same function/theme is not lost. An equivalent anchored task or already-reviewed operation is not repeated. Approved tasks share the same run budget. This is a read-only defensive review queue, not autonomous target testing or exploit generation.
+
+Reports are streamed to `reports/investigations.json`, `reports/summary.md`, `reports/coverage.json`, `reports/candidates.jsonl`, and `reports/followups.jsonl`. They distinguish execution, selected/deferred/excluded candidates, unresolved completed results, intermediate stage evidence, context capability gaps, purpose, and observed usage. A drained queue is not exhaustive vulnerability coverage. Task events and all accepted artifacts remain available. Back up a stopped run after SQLite checkpoints; do not copy a live main database without its WAL.
+
+## Review Coverage Benchmark
+
+```sh
+node Jeeves/dist/src/cli.js review-benchmark --run Jeeves/runs/review-001 \
+  --benchmark Jeeves/benchmarks/juice-shop-20.2.0.json
+```
+
+This optional evaluator is local and read-only with respect to source and task state. It requires the specified repository revision and case file hashes, writes `reports/benchmark.json`, and makes no model calls. Expected labels are never passed to investigation agents. The bundled benchmark is a small source-review obligation set, not a complete list of Juice Shop vulnerabilities or executable reproductions. Historical/unverified cases are separate; the escaped-review-text negative case must not be confused with product-description HTML.
+
+Selection recall, investigation coverage, supported conclusions and potential false-positive flags are separate. Detection is unmeasured before inference. Precision requires independent adjudication of all distinct reports and is not fabricated from this small case list. Dependency versions remain inventory until supported by a reviewed applicable advisory; automatic advisory fetching, runtime exploit validation and complete interprocedural proof are not provided. Held-out repository and live quality evaluation remain release gates.
 
 ## C# And Azure Capability Boundaries
 
@@ -100,7 +126,7 @@ An SDK import, attribute, method name, or model assertion is not proof of runtim
 ## Large-Repository Behavior
 
 - Stream input arrays/JSONL rather than loading entire classification datasets.
-- Keep source/artifact bodies out of the SQLite navigation indexes.
+- Keep source/artifact bodies out of navigation rows; the separate local search index stores bounded comment-masked chunks with original offsets.
 - Use stable generation-bound keyset pages for high-fan-out call searches.
 - Share one lazy TS semantic worker across agents, coalesce identical requests, bound the pending queue, evict idle workspaces and kill timed-out workers.
 - Limit syntax-worker heap and request time. Compiler heap limits are enforced; RSS checks are soft/post-request checks, not a full OS process-tree memory guarantee.
